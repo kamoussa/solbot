@@ -1,0 +1,41 @@
+services:
+  # Redis for price snapshot persistence
+  redis:
+    image: redis:7-alpine
+    container_name: cryptobot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # PostgreSQL for trades, positions, and analytics (future use)
+  postgres:
+    image: postgres:16-alpine
+    container_name: cryptobot-postgres
+    environment:
+      POSTGRES_DB: cryptobot
+      POSTGRES_USER: cryptobot
+      POSTGRES_PASSWORD: cryptobot_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cryptobot"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - full  # Only start with: docker-compose --profile full up
+
+volumes:
+  redis-data:
+  postgres-data:

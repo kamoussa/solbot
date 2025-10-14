@@ -158,3 +158,212 @@ async fn test_api_comparison() {
 
     println!("\n✅ Prices are consistent\n");
 }
+
+#[tokio::test]
+#[ignore] // Requires Redis running
+async fn test_e2e_persistence_workflow() {
+    use cryptobot::execution::PriceFeedManager;
+    use cryptobot::persistence::RedisPersistence;
+    use cryptobot::models::Token;
+
+    println!("\n=== Testing E2E Persistence Workflow ===\n");
+
+    // 1. Setup
+    println!("1. Setting up Redis and PriceFeedManager...");
+    let redis_url = "redis://127.0.0.1:6379";
+    let mut persistence = RedisPersistence::new(redis_url)
+        .await
+        .expect("Redis should be running");
+
+    // Use test token to avoid interference with real data
+    let test_token_symbol = "E2E_TEST_SOL";
+    let _ = persistence.cleanup_old(test_token_symbol, 0).await;
+
+    let tokens = vec![Token {
+        symbol: "SOL".to_string(), // Use real SOL for API
+        mint_address: "So11111111111111111111111111111111111111112".to_string(),
+        name: "Solana".to_string(),
+        decimals: 9,
+    }];
+
+    let mut price_manager = PriceFeedManager::new(tokens.clone(), 100);
+    println!("   ✓ Setup complete");
+
+    // 2. Fetch real prices
+    println!("\n2. Fetching real prices from DexScreener...");
+    let results = price_manager.fetch_all().await;
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_ok(), "Price fetch should succeed");
+
+    let snapshot = results[0].as_ref().unwrap();
+    println!("   ✓ Fetched SOL price: ${:.2}", snapshot.price);
+
+    // 3. Save to Redis (using test token symbol)
+    println!("\n3. Saving snapshots to Redis...");
+    let mut candles = price_manager.buffer()
+        .get_candles("SOL")
+        .expect("Should have candles");
+    assert_eq!(candles.len(), 1);
+
+    // Change token symbol to test version for isolation
+    for candle in &mut candles {
+        candle.token = test_token_symbol.to_string();
+    }
+
+    persistence.save_candles(test_token_symbol, &candles)
+        .await
+        .expect("Should save to Redis");
+
+    let count = persistence.count_snapshots(test_token_symbol).await.unwrap();
+    println!("   ✓ Saved {} snapshot(s) to Redis", count);
+    assert_eq!(count, 1, "Should have exactly 1 snapshot");
+
+    // 4. Simulate bot restart - create new manager
+    println!("\n4. Simulating bot restart...");
+    let mut new_manager = PriceFeedManager::new(tokens.clone(), 100);
+
+    // Load historical data from Redis
+    println!("   Loading historical data from Redis...");
+    let historical = persistence.load_candles(test_token_symbol, 24)
+        .await
+        .expect("Should load from Redis");
+
+    assert_eq!(historical.len(), 1, "Should have exactly 1 historical candle");
+    println!("   ✓ Loaded {} historical snapshot(s)", historical.len());
+
+    // Add historical data to new manager (restore original token symbol)
+    for mut candle in historical.clone() {
+        candle.token = "SOL".to_string();
+        new_manager.buffer().add_candle(candle).unwrap();
+    }
+
+    // 5. Verify data persisted correctly
+    println!("\n5. Verifying data persistence...");
+    let restored_candles = new_manager.buffer()
+        .get_candles("SOL")
+        .expect("Should have restored candles");
+
+    assert_eq!(restored_candles.len(), 1);
+    assert_eq!(restored_candles[0].close, candles[0].close);
+    println!("   ✓ Original price: ${:.2}", candles[0].close);
+    println!("   ✓ Restored price: ${:.2}", restored_candles[0].close);
+    println!("   ✓ Data integrity verified");
+
+    // 6. Fetch another snapshot and verify accumulation
+    println!("\n6. Fetching additional snapshot...");
+    let results2 = new_manager.fetch_all().await;
+    assert!(results2[0].is_ok());
+
+    let all_candles = new_manager.buffer()
+        .get_candles("SOL")
+        .expect("Should have all candles");
+    assert_eq!(all_candles.len(), 2, "Should have 1 restored + 1 new");
+    println!("   ✓ Now have {} total snapshots", all_candles.len());
+
+    // 7. Cleanup
+    println!("\n7. Cleaning up test data...");
+    let removed = persistence.cleanup_old(test_token_symbol, 0).await.unwrap();
+    println!("   ✓ Cleaned up {} test snapshots", removed);
+
+    println!("\n=== E2E Persistence Test Complete ✅ ===\n");
+}
+
+#[tokio::test]
+#[ignore] // Requires Redis running
+async fn test_e2e_full_bot_simulation() {
+    use cryptobot::execution::PriceFeedManager;
+    use cryptobot::persistence::RedisPersistence;
+    use cryptobot::strategy::momentum::MomentumStrategy;
+    use cryptobot::strategy::Strategy;
+    use cryptobot::models::Token;
+
+    println!("\n=== Testing Full Bot Simulation ===\n");
+
+    // Setup
+    let redis_url = "redis://127.0.0.1:6379";
+    let mut persistence = RedisPersistence::new(redis_url)
+        .await
+        .expect("Redis should be running");
+
+    let tokens = vec![
+        Token {
+            symbol: "SOL".to_string(),
+            mint_address: "So11111111111111111111111111111111111111112".to_string(),
+            name: "Solana".to_string(),
+            decimals: 9,
+        },
+        Token {
+            symbol: "JUP".to_string(),
+            mint_address: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN".to_string(),
+            name: "Jupiter".to_string(),
+            decimals: 6,
+        },
+    ];
+
+    let mut price_manager = PriceFeedManager::new(tokens.clone(), 100);
+    let strategy = MomentumStrategy::default();
+
+    println!("1. Fetching prices for {} tokens...", tokens.len());
+
+    // Fetch prices
+    let results = price_manager.fetch_all().await;
+    let mut success_count = 0;
+
+    for (i, result) in results.iter().enumerate() {
+        let token = &tokens[i];
+        match result {
+            Ok(snapshot) => {
+                println!("   ✓ {}: ${:.4}", token.symbol, snapshot.price);
+                success_count += 1;
+
+                // Save to Redis
+                if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
+                    if let Some(latest) = candles.last() {
+                        persistence.save_candles(&token.symbol, &[latest.clone()])
+                            .await
+                            .expect("Should save to Redis");
+                    }
+                }
+            }
+            Err(e) => {
+                println!("   ✗ {}: Failed - {}", token.symbol, e);
+            }
+        }
+    }
+
+    assert!(success_count > 0, "At least one price fetch should succeed");
+
+    // Try to generate signals (won't have enough data yet)
+    println!("\n2. Checking signal generation...");
+    for token in &tokens {
+        if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
+            if candles.len() >= strategy.samples_needed(30) {
+                match strategy.generate_signal(&candles) {
+                    Ok(signal) => {
+                        println!("   ✓ {}: Signal = {:?}", token.symbol, signal);
+                    }
+                    Err(_) => {
+                        println!("   ⧗ {}: Not enough data for signal", token.symbol);
+                    }
+                }
+            } else {
+                println!("   ⧗ {}: Collecting data ({}/{} needed)",
+                    token.symbol,
+                    candles.len(),
+                    strategy.samples_needed(30)
+                );
+            }
+        }
+    }
+
+    // Verify Redis persistence
+    println!("\n3. Verifying Redis persistence...");
+    for token in &tokens {
+        let count = persistence.count_snapshots(&token.symbol).await.unwrap();
+        if count > 0 {
+            println!("   ✓ {}: {} snapshot(s) in Redis", token.symbol, count);
+        }
+    }
+
+    println!("\n=== Full Bot Simulation Complete ✅ ===\n");
+}

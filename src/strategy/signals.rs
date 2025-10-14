@@ -10,6 +10,7 @@ pub struct SignalConfig {
     pub short_ma_period: usize,
     pub long_ma_period: usize,
     pub volume_threshold: f64, // Multiple of average volume
+    pub lookback_hours: u64,   // How many hours of history to analyze
 }
 
 impl Default for SignalConfig {
@@ -21,7 +22,32 @@ impl Default for SignalConfig {
             short_ma_period: 10,
             long_ma_period: 20,
             volume_threshold: 1.5,
+            lookback_hours: 24, // Default: analyze last 24 hours
         }
+    }
+}
+
+impl SignalConfig {
+    /// Calculate how many samples are needed based on lookback period and poll interval
+    ///
+    /// # Arguments
+    /// * `poll_interval_minutes` - How often we sample (e.g., 30 minutes)
+    ///
+    /// # Returns
+    /// Number of samples needed to cover the lookback period
+    ///
+    /// # Example
+    /// ```
+    /// // 24 hour lookback, polling every 30 min = 48 samples
+    /// config.samples_needed(30) // Returns 48
+    /// ```
+    pub fn samples_needed(&self, poll_interval_minutes: u64) -> usize {
+        let lookback_minutes = self.lookback_hours * 60;
+        let samples = lookback_minutes / poll_interval_minutes;
+
+        // Need at least enough for longest indicator
+        let min_for_indicators = self.long_ma_period + 5;
+        samples.max(min_for_indicators as u64) as usize
     }
 }
 
@@ -44,23 +70,47 @@ pub fn analyze_market_conditions(
     let avg_volume = volumes.iter().sum::<f64>() / volumes.len() as f64;
     let current_volume = volumes.last()?;
     let volume_spike = current_volume / avg_volume > config.volume_threshold;
+    let volume_ratio = current_volume / avg_volume;
 
     // Current price
     let current_price = prices.last()?;
 
-    // Signal logic
-    let signal = if is_buy_signal(
-        rsi,
-        short_ma,
-        long_ma,
-        *current_price,
-        volume_spike,
-        config,
-    ) {
+    // Log indicators for debugging
+    tracing::debug!(
+        "Indicators: RSI={:.1}, Short MA={:.4}, Long MA={:.4}, Price={:.4}, Vol Ratio={:.2}x",
+        rsi, short_ma, long_ma, current_price, volume_ratio
+    );
+
+    // Check buy conditions
+    let rsi_condition = rsi < config.rsi_oversold + 10.0;
+    let ma_crossover = short_ma > long_ma;
+    let price_above_ma = *current_price > short_ma;
+
+    let buy_conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
+    let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+
+    // Check sell conditions
+    let rsi_overbought = rsi > config.rsi_overbought;
+    let ma_crossunder = short_ma < long_ma;
+
+    // Determine signal with detailed logging
+    let signal = if buy_count >= 3 {
+        tracing::info!(
+            "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
+            rsi_condition, ma_crossover, price_above_ma, volume_spike, buy_count
+        );
         Signal::Buy
-    } else if is_sell_signal(rsi, short_ma, long_ma, config) {
+    } else if rsi_overbought && ma_crossunder {
+        tracing::info!(
+            "SELL conditions: RSI>70={}, MA↓={} (both required)",
+            rsi_overbought, ma_crossunder
+        );
         Signal::Sell
     } else {
+        tracing::debug!(
+            "HOLD: Buy {}/4, Sell RSI>70={} MA↓={}",
+            buy_count, rsi_overbought, ma_crossunder
+        );
         Signal::Hold
     };
 
@@ -170,6 +220,7 @@ mod tests {
             short_ma_period: 5,
             long_ma_period: 15,
             volume_threshold: 2.0,
+            lookback_hours: 6,
         };
 
         let prices = vec![100.0; 20];

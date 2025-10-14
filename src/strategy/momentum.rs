@@ -20,6 +20,25 @@ impl MomentumStrategy {
         Self { config }
     }
 
+    /// Calculate samples needed based on poll interval
+    ///
+    /// # Arguments
+    /// * `poll_interval_minutes` - How often we sample prices
+    ///
+    /// # Example
+    /// ```
+    /// // 24hr lookback, 30min polling = 48 samples needed
+    /// strategy.samples_needed(30); // Returns 48
+    /// ```
+    pub fn samples_needed(&self, poll_interval_minutes: u64) -> usize {
+        self.config.samples_needed(poll_interval_minutes)
+    }
+
+    /// Get lookback duration in hours
+    pub fn lookback_hours(&self) -> u64 {
+        self.config.lookback_hours
+    }
+
     /// Extract prices from candles
     fn extract_prices(candles: &[Candle]) -> Vec<f64> {
         candles.iter().map(|c| c.close).collect()
@@ -139,10 +158,15 @@ mod tests {
             short_ma_period: 5,
             long_ma_period: 15,
             volume_threshold: 2.0,
+            lookback_hours: 12,
         };
 
         let strategy = MomentumStrategy::new(config);
         assert_eq!(strategy.min_candles_required(), 20); // 15 + 5
+        assert_eq!(strategy.lookback_hours(), 12);
+
+        // Test samples calculation: 12 hours / 30 min = 24 samples
+        assert_eq!(strategy.samples_needed(30), 24);
     }
 
     #[test]

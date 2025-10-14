@@ -38,9 +38,10 @@ struct VolumeData {
     h24: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct PriceChange {
-    h24: f64,
+    #[serde(default)]
+    h24: Option<f64>,
 }
 
 impl DexScreenerClient {

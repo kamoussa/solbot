@@ -7,6 +7,7 @@ pub mod execution;
 pub mod risk;
 pub mod db;
 pub mod llm;
+pub mod persistence;
 
 // Re-export commonly used types
 pub use models::*;
