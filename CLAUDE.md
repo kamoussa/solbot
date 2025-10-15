@@ -138,3 +138,68 @@ This repository follows a structured four-phase development process for all feat
 - Integration tests marked with `#[ignore]` to avoid hitting APIs
 - Use `mockito` for mocking external services
 - Property-based testing with `proptest` for critical calculations
+
+## Code Cleanup and Simplification
+
+Maintain minimal complexity and clean code by following these guidelines:
+
+### Regular Cleanup Checks
+```bash
+# Check for compiler warnings
+cargo build 2>&1 | grep warning
+
+# Run clippy for code quality
+cargo clippy --all-targets
+
+# Verify all tests pass
+cargo test
+```
+
+### Handling Unused Code
+
+**Remove immediately**:
+- Unused imports
+- Unused functions that are clearly obsolete
+- Dead code paths that will never be used
+
+**Annotate if necessary**:
+- API response fields: Use `#[allow(dead_code)]` for fields required by serde but not used in code
+- Test helpers: Prefix with `_` if intentionally unused (e.g., `_id2`)
+- Future features: Add TODO comments explaining why code is kept
+
+### Documentation Management
+
+**Keep in main `docs/` folder**:
+- `ARCHITECTURE.md` - Core system design
+- `DEPLOYMENT.md` - Deployment guide
+- `MULTI_USER_ARCHITECTURE.md` - Future architecture plans
+
+**Archive to `docs/archive/`**:
+- Completed planning documents
+- Historical critiques and session summaries
+- Superseded documentation
+
+### Testing Requirements
+
+**Every new function must have tests**:
+- Happy path tests
+- Edge case tests (empty input, single item, boundaries)
+- Error condition tests
+- Integration points
+
+**Example**: When adding `validate_candle_uniformity()`, add tests for:
+- Uniform data (should pass)
+- Data with gaps (should fail)
+- Single candle (edge case)
+- Backwards timestamps (should fail)
+- Tolerance boundaries
+
+### Cleanup Checklist
+
+Before considering any feature complete:
+- [ ] No compiler warnings about unused code
+- [ ] All new functions have comprehensive tests
+- [ ] No commented-out code
+- [ ] Documentation is up-to-date or archived
+- [ ] `cargo clippy` shows no new warnings
+- [ ] All tests pass: `cargo test`

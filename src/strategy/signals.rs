@@ -1,5 +1,5 @@
-use crate::models::Signal;
-use crate::indicators::{calculate_rsi, calculate_sma, calculate_ema};
+use crate::models::{Candle, Signal};
+use crate::indicators::{calculate_rsi, calculate_sma};
 
 /// Configuration for signal generation
 #[derive(Debug, Clone)]
@@ -49,6 +49,54 @@ impl SignalConfig {
         let min_for_indicators = self.long_ma_period + 5;
         samples.max(min_for_indicators as u64) as usize
     }
+}
+
+/// Validate that candles are uniformly spaced in time
+///
+/// # Arguments
+/// * `candles` - The candles to validate
+/// * `expected_interval_secs` - Expected time between candles in seconds
+///
+/// # Returns
+/// * `Ok(())` if candles are uniformly spaced (within tolerance)
+/// * `Err` if there are gaps in the data
+///
+/// # Tolerance
+/// Allows up to 1.5x the expected interval (e.g., 7.5 min for 5 min polling)
+pub fn validate_candle_uniformity(
+    candles: &[Candle],
+    expected_interval_secs: u64,
+) -> anyhow::Result<()> {
+    if candles.len() < 2 {
+        return Ok(());
+    }
+
+    // Allow 50% tolerance for slight timing variations
+    let max_gap_secs = expected_interval_secs + (expected_interval_secs / 2);
+
+    for window in candles.windows(2) {
+        let time_diff = (window[1].timestamp - window[0].timestamp).num_seconds();
+
+        if time_diff < 0 {
+            anyhow::bail!("Candles are not sorted by timestamp");
+        }
+
+        let time_diff_u64 = time_diff as u64;
+
+        if time_diff_u64 > max_gap_secs {
+            anyhow::bail!(
+                "Data gap detected: {}s between candles (expected ~{}s, max allowed {}s). \
+                 Gap from {} to {}. Consider clearing Redis and collecting fresh data.",
+                time_diff_u64,
+                expected_interval_secs,
+                max_gap_secs,
+                window[0].timestamp.format("%H:%M:%S"),
+                window[1].timestamp.format("%H:%M:%S")
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Analyze market conditions and generate composite signal
@@ -117,44 +165,78 @@ pub fn analyze_market_conditions(
     Some(signal)
 }
 
-fn is_buy_signal(
-    rsi: f64,
-    short_ma: f64,
-    long_ma: f64,
-    current_price: f64,
-    volume_spike: bool,
-    config: &SignalConfig,
-) -> bool {
-    // Buy conditions:
-    // 1. RSI shows oversold OR approaching neutral from oversold
-    // 2. Short MA crossing above long MA (bullish momentum)
-    // 3. Price above short MA (confirmation)
-    // 4. Volume spike (strong interest)
-
-    let rsi_condition = rsi < config.rsi_oversold + 10.0; // Oversold or recovering
-    let ma_crossover = short_ma > long_ma;
-    let price_above_ma = current_price > short_ma;
-
-    // Require at least 3 out of 4 conditions
-    let conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
-    conditions.iter().filter(|&&x| x).count() >= 3
-}
-
-fn is_sell_signal(rsi: f64, short_ma: f64, long_ma: f64, config: &SignalConfig) -> bool {
-    // Sell conditions:
-    // 1. RSI shows overbought
-    // 2. Short MA crossing below long MA (bearish momentum)
-
-    let rsi_overbought = rsi > config.rsi_overbought;
-    let ma_crossunder = short_ma < long_ma;
-
-    // Require both conditions for sell (conservative)
-    rsi_overbought && ma_crossunder
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
+
+    fn create_test_candle(minutes_ago: i64) -> Candle {
+        Candle {
+            token: "TEST".to_string(),
+            timestamp: Utc::now() - Duration::minutes(minutes_ago),
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
+            volume: 1000.0,
+        }
+    }
+
+    #[test]
+    fn test_uniform_candles_pass() {
+        let candles = vec![
+            create_test_candle(10),
+            create_test_candle(5),
+            create_test_candle(0),
+        ];
+
+        let result = validate_candle_uniformity(&candles, 300); // 5 min = 300 sec
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_gap_detected() {
+        let candles = vec![
+            create_test_candle(60),  // 60 min ago
+            create_test_candle(5),   // 5 min ago - 55 min gap!
+            create_test_candle(0),
+        ];
+
+        let result = validate_candle_uniformity(&candles, 300);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("gap"));
+    }
+
+    #[test]
+    fn test_backwards_timestamps_fail() {
+        let candles = vec![
+            create_test_candle(0),
+            create_test_candle(5),  // Backwards!
+        ];
+
+        let result = validate_candle_uniformity(&candles, 300);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not sorted"));
+    }
+
+    #[test]
+    fn test_single_candle_ok() {
+        let candles = vec![create_test_candle(0)];
+        let result = validate_candle_uniformity(&candles, 300);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tolerance_allows_slight_variation() {
+        let candles = vec![
+            create_test_candle(13),  // 13 min ago
+            create_test_candle(6),   // 6 min ago (7 min gap, within 50% tolerance of 5 min)
+            create_test_candle(0),
+        ];
+
+        let result = validate_candle_uniformity(&candles, 300);
+        assert!(result.is_ok()); // Should pass with 50% tolerance
+    }
 
     #[test]
     fn test_signal_generation_buy() {

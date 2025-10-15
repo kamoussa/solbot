@@ -2,7 +2,7 @@ use crate::models::{Candle, PriceData, DataSource};
 use crate::Result;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 const DEXSCREENER_API_BASE: &str = "https://api.dexscreener.com/latest/dex";
 
@@ -24,12 +24,14 @@ struct PairData {
     base_token: TokenInfo,
     price_usd: String,
     volume: VolumeData,
+    #[allow(dead_code)]
     price_change: PriceChange,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenInfo {
     symbol: String,
+    #[allow(dead_code)]
     address: String,
 }
 
@@ -41,6 +43,7 @@ struct VolumeData {
 #[derive(Debug, Deserialize, Default)]
 struct PriceChange {
     #[serde(default)]
+    #[allow(dead_code)]
     h24: Option<f64>,
 }
 
@@ -54,7 +57,6 @@ impl DexScreenerClient {
     /// Get current price for a token by its mint address
     pub async fn get_price(&self, token_address: &str) -> Result<PriceData> {
         let url = format!("{}/tokens/{}", DEXSCREENER_API_BASE, token_address);
-        tracing::info!("URL: {}", url);
 
         let response_raw = self.client
             .get(&url)

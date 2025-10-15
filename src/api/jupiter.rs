@@ -15,14 +15,19 @@ pub struct JupiterClient {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QuoteResponse {
+    #[allow(dead_code)]
     input_mint: String,
     in_amount: String,
+    #[allow(dead_code)]
     output_mint: String,
     out_amount: String,
+    #[allow(dead_code)]
     other_amount_threshold: String,
     price_impact_pct: String,
     #[serde(default)]
+    #[allow(dead_code)]
     route_plan: Vec<serde_json::Value>,  // Complex nested structure, using Value for now
+    #[allow(dead_code)]
     context_slot: Option<u64>,
 }
 

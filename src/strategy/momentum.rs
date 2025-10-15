@@ -1,4 +1,4 @@
-use super::{Strategy, signals::{SignalConfig, analyze_market_conditions}};
+use super::{Strategy, signals::{SignalConfig, analyze_market_conditions, validate_candle_uniformity}};
 use crate::models::{Candle, Signal};
 use crate::Result;
 
@@ -13,11 +13,20 @@ use crate::Result;
 #[derive(Debug, Clone)]
 pub struct MomentumStrategy {
     config: SignalConfig,
+    poll_interval_minutes: u64,
 }
 
 impl MomentumStrategy {
     pub fn new(config: SignalConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            poll_interval_minutes: 5, // Default: 5 minutes
+        }
+    }
+
+    pub fn with_poll_interval(mut self, poll_interval_minutes: u64) -> Self {
+        self.poll_interval_minutes = poll_interval_minutes;
+        self
     }
 
     /// Calculate samples needed based on poll interval
@@ -67,6 +76,10 @@ impl Strategy for MomentumStrategy {
             .into());
         }
 
+        // Validate that candles are uniformly spaced (no gaps)
+        let expected_interval_secs = self.poll_interval_minutes * 60;
+        validate_candle_uniformity(candles, expected_interval_secs)?;
+
         let prices = Self::extract_prices(candles);
         let volumes = Self::extract_volumes(candles);
 
@@ -98,7 +111,8 @@ mod tests {
             .enumerate()
             .map(|(i, (&price, &volume))| Candle {
                 token: "TEST".to_string(),
-                timestamp: Utc::now() - chrono::Duration::hours((prices.len() - i) as i64),
+                // Space candles 5 minutes apart to match polling interval
+                timestamp: Utc::now() - chrono::Duration::minutes((prices.len() - i) as i64 * 5),
                 open: price,
                 high: price * 1.01,
                 low: price * 0.99,

@@ -1,4 +1,22 @@
 services:
+  # CryptoBot - Trading bot
+  bot:
+    build: .
+    container_name: cryptobot
+    environment:
+      REDIS_URL: redis://redis:6379
+      RUST_LOG: info
+      INITIAL_PORTFOLIO_VALUE: 10000.0
+      # Add your wallet private key here (or use .env file)
+      # WALLET_PRIVATE_KEY: your_base58_key_here
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Mount .env file for secrets (alternative to environment variables)
+    # env_file:
+    #   - .env
+
   # Redis for price snapshot persistence
   redis:
     image: redis:7-alpine
