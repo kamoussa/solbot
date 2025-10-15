@@ -5,12 +5,15 @@ services:
     container_name: cryptobot
     environment:
       REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://cryptobot:cryptobot_dev_password@postgres:5432/cryptobot
       RUST_LOG: info
       INITIAL_PORTFOLIO_VALUE: 10000.0
       # Add your wallet private key here (or use .env file)
       # WALLET_PRIVATE_KEY: your_base58_key_here
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     restart: unless-stopped
     # Mount .env file for secrets (alternative to environment variables)
@@ -33,7 +36,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # PostgreSQL for trades, positions, and analytics (future use)
+  # PostgreSQL for positions and P&L tracking
   postgres:
     image: postgres:16-alpine
     container_name: cryptobot-postgres
@@ -51,8 +54,6 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
-    profiles:
-      - full  # Only start with: docker-compose --profile full up
 
 volumes:
   redis-data:

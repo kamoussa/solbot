@@ -1,2 +1,4 @@
 // Database module
-// TODO: Implement PostgreSQL/TimescaleDB integration
+pub mod postgres;
+
+pub use postgres::PostgresPersistence;

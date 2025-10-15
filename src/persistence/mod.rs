@@ -14,7 +14,7 @@ struct StoredSnapshot {
     timestamp: DateTime<Utc>,
 }
 
-/// Redis persistence for price snapshots
+/// Redis persistence for price candles/snapshots
 ///
 /// Uses sorted sets with timestamps as scores for efficient time-range queries
 pub struct RedisPersistence {

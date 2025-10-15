@@ -54,6 +54,46 @@ impl PositionManager {
         }
     }
 
+    /// Create PositionManager and restore from loaded positions
+    ///
+    /// Recalculates total_pnl from closed positions
+    pub fn with_positions(
+        initial_portfolio_value: f64,
+        circuit_breakers: CircuitBreakers,
+        positions: Vec<Position>,
+    ) -> Self {
+        // Calculate total_pnl from closed positions
+        let total_pnl: f64 = positions
+            .iter()
+            .filter(|p| p.status == PositionStatus::Closed)
+            .filter_map(|p| p.realized_pnl)
+            .sum();
+
+        tracing::info!(
+            "Restored {} positions from persistence (total P&L: ${:.2})",
+            positions.len(),
+            total_pnl
+        );
+
+        Self {
+            positions,
+            circuit_breakers,
+            trading_state: TradingState::new(initial_portfolio_value),
+            initial_portfolio_value,
+            total_pnl,
+        }
+    }
+
+    /// Get all positions (both open and closed)
+    pub fn all_positions(&self) -> &[Position] {
+        &self.positions
+    }
+
+    /// Get total realized P&L
+    pub fn total_pnl(&self) -> f64 {
+        self.total_pnl
+    }
+
     /// Create new position
     pub fn open_position(
         &mut self,

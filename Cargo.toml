@@ -15,7 +15,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate", "rust_decimal"] }
+rust_decimal = "1.36"
 
 # Cache / Persistence
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
