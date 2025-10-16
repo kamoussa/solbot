@@ -15,4 +15,15 @@ pub trait Strategy: Send + Sync {
 
     /// Minimum candles required for this strategy
     fn min_candles_required(&self) -> usize;
+
+    /// Number of candles required for lookback at given polling interval
+    /// Default implementation uses min_candles_required
+    fn samples_needed(&self, _poll_interval_minutes: u64) -> usize {
+        self.min_candles_required()
+    }
+
+    /// Lookback period in hours for this strategy
+    fn lookback_hours(&self) -> u64 {
+        24 // Default 24 hours
+    }
 }

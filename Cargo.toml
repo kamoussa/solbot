@@ -42,6 +42,9 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 # Technical analysis
 yata = "0.7"
 
+# Random number generation (for backtesting)
+rand = "0.8"
+
 [dev-dependencies]
 # Testing
 mockito = "1.6"

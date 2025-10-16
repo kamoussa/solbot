@@ -1,7 +1,7 @@
-use cryptobot::*;
 use cryptobot::api::{DexScreenerClient, JupiterClient};
 use cryptobot::indicators::{calculate_rsi, calculate_sma};
 use cryptobot::risk::{CircuitBreakers, TradingState};
+use cryptobot::*;
 
 #[tokio::test]
 async fn test_e2e_workflow() {
@@ -41,8 +41,8 @@ async fn test_e2e_workflow() {
     // 3. Test Technical Indicators
     println!("\n3. Testing Technical Indicators...");
     let prices = vec![
-        100.0, 102.0, 101.0, 103.0, 105.0, 104.0, 106.0, 108.0,
-        107.0, 109.0, 111.0, 110.0, 112.0, 114.0, 113.0,
+        100.0, 102.0, 101.0, 103.0, 105.0, 104.0, 106.0, 108.0, 107.0, 109.0, 111.0, 110.0, 112.0,
+        114.0, 113.0,
     ];
 
     let rsi = calculate_rsi(&prices, 14);
@@ -67,7 +67,10 @@ async fn test_e2e_workflow() {
     state.daily_pnl = -600.0; // -6%
     state.portfolio_value = 9400.0;
     let result = breakers.check(&state);
-    assert!(result.is_err(), "Circuit breaker should trip on -6% daily loss");
+    assert!(
+        result.is_err(),
+        "Circuit breaker should trip on -6% daily loss"
+    );
     println!("   ✓ Daily loss limit: Triggered correctly");
 
     // 5. Simulate a simple trading decision
@@ -93,9 +96,9 @@ async fn test_e2e_workflow() {
 
     // 6. Test Position Creation
     println!("\n6. Testing Position Management...");
+    use chrono::Utc;
     use cryptobot::models::{Position, PositionStatus};
     use uuid::Uuid;
-    use chrono::Utc;
 
     let position = Position {
         id: Uuid::new_v4(),
@@ -112,7 +115,10 @@ async fn test_e2e_workflow() {
     println!("     Entry: ${:.2}", position.entry_price);
     println!("     Quantity: {}", position.quantity);
     println!("     Stop Loss: ${:.2}", position.stop_loss);
-    println!("     Value: ${:.2}", position.entry_price * position.quantity);
+    println!(
+        "     Value: ${:.2}",
+        position.entry_price * position.quantity
+    );
 
     println!("\n=== E2E Test Complete ✅ ===");
 }
@@ -133,7 +139,9 @@ async fn test_api_comparison() {
     let dex_price = dex_price.unwrap().price;
 
     // Get price from Jupiter (1 SOL -> USDC)
-    let jup_quote = jup_client.get_quote(sol_mint, usdc_mint, 1_000_000_000, 50).await;
+    let jup_quote = jup_client
+        .get_quote(sol_mint, usdc_mint, 1_000_000_000, 50)
+        .await;
     assert!(jup_quote.is_ok());
     let quote = jup_quote.unwrap();
 
@@ -163,8 +171,8 @@ async fn test_api_comparison() {
 #[ignore] // Requires Redis running
 async fn test_e2e_persistence_workflow() {
     use cryptobot::execution::PriceFeedManager;
-    use cryptobot::persistence::RedisPersistence;
     use cryptobot::models::Token;
+    use cryptobot::persistence::RedisPersistence;
 
     println!("\n=== Testing E2E Persistence Workflow ===\n");
 
@@ -200,7 +208,8 @@ async fn test_e2e_persistence_workflow() {
 
     // 3. Save to Redis (using test token symbol)
     println!("\n3. Saving snapshots to Redis...");
-    let mut candles = price_manager.buffer()
+    let mut candles = price_manager
+        .buffer()
         .get_candles("SOL")
         .expect("Should have candles");
     assert_eq!(candles.len(), 1);
@@ -210,11 +219,15 @@ async fn test_e2e_persistence_workflow() {
         candle.token = test_token_symbol.to_string();
     }
 
-    persistence.save_candles(test_token_symbol, &candles)
+    persistence
+        .save_candles(test_token_symbol, &candles)
         .await
         .expect("Should save to Redis");
 
-    let count = persistence.count_snapshots(test_token_symbol).await.unwrap();
+    let count = persistence
+        .count_snapshots(test_token_symbol)
+        .await
+        .unwrap();
     println!("   ✓ Saved {} snapshot(s) to Redis", count);
     assert_eq!(count, 1, "Should have exactly 1 snapshot");
 
@@ -224,11 +237,16 @@ async fn test_e2e_persistence_workflow() {
 
     // Load historical data from Redis
     println!("   Loading historical data from Redis...");
-    let historical = persistence.load_candles(test_token_symbol, 24)
+    let historical = persistence
+        .load_candles(test_token_symbol, 24)
         .await
         .expect("Should load from Redis");
 
-    assert_eq!(historical.len(), 1, "Should have exactly 1 historical candle");
+    assert_eq!(
+        historical.len(),
+        1,
+        "Should have exactly 1 historical candle"
+    );
     println!("   ✓ Loaded {} historical snapshot(s)", historical.len());
 
     // Add historical data to new manager (restore original token symbol)
@@ -239,7 +257,8 @@ async fn test_e2e_persistence_workflow() {
 
     // 5. Verify data persisted correctly
     println!("\n5. Verifying data persistence...");
-    let restored_candles = new_manager.buffer()
+    let restored_candles = new_manager
+        .buffer()
         .get_candles("SOL")
         .expect("Should have restored candles");
 
@@ -254,7 +273,8 @@ async fn test_e2e_persistence_workflow() {
     let results2 = new_manager.fetch_all().await;
     assert!(results2[0].is_ok());
 
-    let all_candles = new_manager.buffer()
+    let all_candles = new_manager
+        .buffer()
         .get_candles("SOL")
         .expect("Should have all candles");
     assert_eq!(all_candles.len(), 2, "Should have 1 restored + 1 new");
@@ -272,10 +292,10 @@ async fn test_e2e_persistence_workflow() {
 #[ignore] // Requires Redis running
 async fn test_e2e_full_bot_simulation() {
     use cryptobot::execution::PriceFeedManager;
+    use cryptobot::models::Token;
     use cryptobot::persistence::RedisPersistence;
     use cryptobot::strategy::momentum::MomentumStrategy;
     use cryptobot::strategy::Strategy;
-    use cryptobot::models::Token;
 
     println!("\n=== Testing Full Bot Simulation ===\n");
 
@@ -319,7 +339,8 @@ async fn test_e2e_full_bot_simulation() {
                 // Save to Redis
                 if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
                     if let Some(latest) = candles.last() {
-                        persistence.save_candles(&token.symbol, &[latest.clone()])
+                        persistence
+                            .save_candles(&token.symbol, &[latest.clone()])
                             .await
                             .expect("Should save to Redis");
                     }
@@ -347,7 +368,8 @@ async fn test_e2e_full_bot_simulation() {
                     }
                 }
             } else {
-                println!("   ⧗ {}: Collecting data ({}/{} needed)",
+                println!(
+                    "   ⧗ {}: Collecting data ({}/{} needed)",
                     token.symbol,
                     candles.len(),
                     strategy.samples_needed(30)

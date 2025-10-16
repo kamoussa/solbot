@@ -25,7 +25,7 @@ pub struct Position {
     pub entry_price: f64,
     pub quantity: f64,
     pub entry_time: DateTime<Utc>,
-    pub stop_loss: f64,          // -8% from entry
+    pub stop_loss: f64,           // -8% from entry
     pub take_profit: Option<f64>, // Trailing stop
     pub trailing_high: f64,       // Track highest price for trailing stop
     pub status: PositionStatus,
@@ -167,7 +167,11 @@ impl PositionManager {
     }
 
     /// Update trailing stop if price hit new high
-    fn update_trailing_stop(&mut self, position_id: Uuid, current_price: f64) -> anyhow::Result<()> {
+    fn update_trailing_stop(
+        &mut self,
+        position_id: Uuid,
+        current_price: f64,
+    ) -> anyhow::Result<()> {
         let position = self.get_position_mut(position_id)?;
 
         // Activation price: +12% from entry
@@ -293,7 +297,11 @@ impl PositionManager {
         total_value += self.total_pnl;
 
         // Add unrealized P&L from open positions
-        for position in self.positions.iter().filter(|p| p.status == PositionStatus::Open) {
+        for position in self
+            .positions
+            .iter()
+            .filter(|p| p.status == PositionStatus::Open)
+        {
             if let Some(&current_price) = prices.get(&position.token) {
                 let unrealized_pnl = (current_price - position.entry_price) * position.quantity;
                 total_value += unrealized_pnl;
@@ -355,7 +363,10 @@ mod tests {
 
         let result = pm.open_position("SOL".to_string(), 105.0, 1.0);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Already have open position"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Already have open position"));
     }
 
     #[test]
@@ -453,7 +464,8 @@ mod tests {
         let id = pm.open_position("SOL".to_string(), 100.0, 2.0).unwrap();
 
         // Close position at 110 with take profit
-        pm.close_position(id, 110.0, ExitReason::TakeProfit).unwrap();
+        pm.close_position(id, 110.0, ExitReason::TakeProfit)
+            .unwrap();
 
         let position = pm.get_position(id).unwrap();
         assert_eq!(position.status, PositionStatus::Closed);
@@ -489,7 +501,8 @@ mod tests {
         let mut pm = PositionManager::new(10000.0, CircuitBreakers::default());
         let id = pm.open_position("SOL".to_string(), 100.0, 1.0).unwrap();
 
-        pm.close_position(id, 110.0, ExitReason::TakeProfit).unwrap();
+        pm.close_position(id, 110.0, ExitReason::TakeProfit)
+            .unwrap();
 
         let result = pm.close_position(id, 115.0, ExitReason::Manual);
         assert!(result.is_err());
@@ -542,7 +555,8 @@ mod tests {
         assert_eq!(portfolio_value, 10020.0);
 
         // Close position
-        pm.close_position(id, 110.0, ExitReason::TakeProfit).unwrap();
+        pm.close_position(id, 110.0, ExitReason::TakeProfit)
+            .unwrap();
 
         // Now portfolio should include realized P&L
         let portfolio_value = pm.portfolio_value(&prices).unwrap();
@@ -559,7 +573,8 @@ mod tests {
         assert_eq!(pm.open_positions().len(), 2);
 
         // Close one position
-        pm.close_position(id1, 110.0, ExitReason::TakeProfit).unwrap();
+        pm.close_position(id1, 110.0, ExitReason::TakeProfit)
+            .unwrap();
 
         assert_eq!(pm.open_positions().len(), 1);
         assert_eq!(pm.open_positions()[0].token, "JUP");

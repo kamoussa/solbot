@@ -54,7 +54,8 @@ impl Executor {
 
                 // Check 3: Calculate size (5% of portfolio)
                 let max_position_pct = pm.circuit_breakers().max_position_size_pct;
-                let quantity = self.calculate_position_size(&pm, current_price, max_position_pct)?;
+                let quantity =
+                    self.calculate_position_size(&pm, current_price, max_position_pct)?;
 
                 // Execute
                 Ok(ExecutionDecision {
@@ -135,9 +136,7 @@ mod tests {
             .unwrap();
 
         let mut executor = Executor::new(pm);
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 105.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 105.0).unwrap();
 
         assert!(matches!(decision.action, ExecutionAction::Skip));
         assert!(decision.reason.contains("Already have"));
@@ -167,9 +166,7 @@ mod tests {
         )));
         let mut executor = Executor::new(pm);
 
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 100.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 100.0).unwrap();
 
         assert!(matches!(decision.action, ExecutionAction::Execute { .. }));
         if let ExecutionAction::Execute { quantity } = decision.action {
@@ -221,9 +218,7 @@ mod tests {
         }
 
         let mut executor = Executor::new(pm);
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 100.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 100.0).unwrap();
 
         assert!(matches!(decision.action, ExecutionAction::Skip));
         assert!(decision.reason.contains("Circuit breaker"));
@@ -282,9 +277,7 @@ mod tests {
         let mut executor = Executor::new(pm.clone());
 
         // Buy signal - should execute
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 100.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 100.0).unwrap();
         assert!(matches!(decision.action, ExecutionAction::Execute { .. }));
 
         // Create position (simulating execution)
@@ -294,9 +287,7 @@ mod tests {
             .unwrap();
 
         // Buy signal again - should skip (already have position)
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 105.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 105.0).unwrap();
         assert!(matches!(decision.action, ExecutionAction::Skip));
 
         // Sell signal - should close position
@@ -320,9 +311,7 @@ mod tests {
         assert!(matches!(decision.action, ExecutionAction::Skip));
 
         // Buy signal again - should execute (no position)
-        let decision = executor
-            .process_signal(&Signal::Buy, "SOL", 110.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Buy, "SOL", 110.0).unwrap();
         assert!(matches!(decision.action, ExecutionAction::Execute { .. }));
     }
 }

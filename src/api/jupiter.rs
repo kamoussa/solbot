@@ -26,7 +26,7 @@ struct QuoteResponse {
     price_impact_pct: String,
     #[serde(default)]
     #[allow(dead_code)]
-    route_plan: Vec<serde_json::Value>,  // Complex nested structure, using Value for now
+    route_plan: Vec<serde_json::Value>, // Complex nested structure, using Value for now
     #[allow(dead_code)]
     context_slot: Option<u64>,
 }
@@ -34,7 +34,7 @@ struct QuoteResponse {
 /// Quote information from Jupiter
 #[derive(Debug, Clone)]
 pub struct Quote {
-    pub price: f64,           // Output per unit of input
+    pub price: f64,            // Output per unit of input
     pub price_impact_pct: f64, // Price impact percentage
     pub in_amount: u64,
     pub out_amount: u64,
@@ -67,12 +67,7 @@ impl JupiterClient {
         );
         tracing::info!("URL: {}", url);
 
-        let response: QuoteResponse = self.client
-            .get(&url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let response: QuoteResponse = self.client.get(&url).send().await?.json().await?;
         tracing::info!("Response: {:?}", response);
 
         let in_amount: u64 = response.in_amount.parse()?;
@@ -128,7 +123,9 @@ mod tests {
         let amount = 1_000_000_000; // 1 SOL (9 decimals)
         let slippage = 50; // 0.5% slippage
 
-        let result = client.get_quote(sol_mint, usdc_mint, amount, slippage).await;
+        let result = client
+            .get_quote(sol_mint, usdc_mint, amount, slippage)
+            .await;
         assert!(result.is_ok());
 
         let quote = result.unwrap();

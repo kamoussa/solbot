@@ -14,11 +14,11 @@ pub struct CircuitBreakers {
 impl Default for CircuitBreakers {
     fn default() -> Self {
         Self {
-            max_daily_loss_pct: 0.05,      // -5% daily
-            max_drawdown_pct: 0.20,         // -20% from peak
-            max_consecutive_losses: 5,       // 5 losses in a row
-            max_position_size_pct: 0.05,    // 5% max per position
-            max_daily_trades: 10,            // Max 10 trades per day
+            max_daily_loss_pct: 0.05,    // -5% daily
+            max_drawdown_pct: 0.20,      // -20% from peak
+            max_consecutive_losses: 5,   // 5 losses in a row
+            max_position_size_pct: 0.05, // 5% max per position
+            max_daily_trades: 10,        // Max 10 trades per day
         }
     }
 }
@@ -70,8 +70,8 @@ impl CircuitBreakers {
         }
 
         // Check drawdown
-        let drawdown = (state.peak_portfolio_value - state.portfolio_value)
-            / state.peak_portfolio_value;
+        let drawdown =
+            (state.peak_portfolio_value - state.portfolio_value) / state.peak_portfolio_value;
         if drawdown > self.max_drawdown_pct {
             return Err(CircuitBreakerTrip::MaxDrawdown);
         }

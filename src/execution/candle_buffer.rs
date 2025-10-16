@@ -29,7 +29,9 @@ impl CandleBuffer {
     pub fn add_candle(&self, candle: Candle) -> Result<(), String> {
         let mut data = self.data.write().map_err(|e| e.to_string())?;
 
-        let token_candles = data.entry(candle.token.clone()).or_insert_with(VecDeque::new);
+        let token_candles = data
+            .entry(candle.token.clone())
+            .or_insert_with(VecDeque::new);
 
         // Add new candle
         token_candles.push_back(candle);
@@ -58,15 +60,7 @@ impl CandleBuffer {
 
         Ok(data
             .get(token)
-            .map(|deque| {
-                deque
-                    .iter()
-                    .rev()
-                    .take(n)
-                    .rev()
-                    .cloned()
-                    .collect()
-            })
+            .map(|deque| deque.iter().rev().take(n).rev().cloned().collect())
             .unwrap_or_default())
     }
 
@@ -151,7 +145,9 @@ mod tests {
 
         // Add 10 candles
         for i in 0..10 {
-            buffer.add_candle(create_test_candle("SOL", 100.0 + i as f64)).unwrap();
+            buffer
+                .add_candle(create_test_candle("SOL", 100.0 + i as f64))
+                .unwrap();
         }
 
         let candles = buffer.get_candles("SOL").unwrap();
@@ -168,7 +164,9 @@ mod tests {
 
         buffer.add_candle(create_test_candle("SOL", 100.0)).unwrap();
         buffer.add_candle(create_test_candle("JUP", 200.0)).unwrap();
-        buffer.add_candle(create_test_candle("BONK", 300.0)).unwrap();
+        buffer
+            .add_candle(create_test_candle("BONK", 300.0))
+            .unwrap();
 
         let tokens = buffer.tokens().unwrap();
         assert_eq!(tokens.len(), 3);
@@ -182,7 +180,9 @@ mod tests {
         let buffer = CandleBuffer::new(100);
 
         for i in 0..10 {
-            buffer.add_candle(create_test_candle("SOL", 100.0 + i as f64)).unwrap();
+            buffer
+                .add_candle(create_test_candle("SOL", 100.0 + i as f64))
+                .unwrap();
         }
 
         let recent = buffer.get_recent_candles("SOL", 3).unwrap();
@@ -225,12 +225,16 @@ mod tests {
 
         let handle = thread::spawn(move || {
             for i in 0..50 {
-                buffer_clone.add_candle(create_test_candle("SOL", 100.0 + i as f64)).unwrap();
+                buffer_clone
+                    .add_candle(create_test_candle("SOL", 100.0 + i as f64))
+                    .unwrap();
             }
         });
 
         for i in 50..100 {
-            buffer.add_candle(create_test_candle("SOL", 100.0 + i as f64)).unwrap();
+            buffer
+                .add_candle(create_test_candle("SOL", 100.0 + i as f64))
+                .unwrap();
         }
 
         handle.join().unwrap();

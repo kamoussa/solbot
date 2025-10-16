@@ -1,4 +1,4 @@
-use crate::models::{Candle, PriceData, DataSource};
+use crate::models::{Candle, DataSource, PriceData};
 use crate::Result;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -58,10 +58,7 @@ impl DexScreenerClient {
     pub async fn get_price(&self, token_address: &str) -> Result<PriceData> {
         let url = format!("{}/tokens/{}", DEXSCREENER_API_BASE, token_address);
 
-        let response_raw = self.client
-            .get(&url)
-            .send()
-            .await?;
+        let response_raw = self.client.get(&url).send().await?;
         //tracing::info!("Response: {:?}", response_raw.status());
         //tracing::info!("Response: {:?}", response_raw.headers());
         let response: DexScreenerResponse = response_raw.json().await?;
@@ -107,7 +104,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore]  // Ignore by default to avoid hitting API in tests
+    #[ignore] // Ignore by default to avoid hitting API in tests
     async fn test_get_price_live() {
         let client = DexScreenerClient::new();
 

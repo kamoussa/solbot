@@ -1,17 +1,18 @@
 // Core modules
 pub mod api;
-pub mod models;
-pub mod indicators;
-pub mod strategy;
-pub mod execution;
-pub mod risk;
+pub mod backtest;
 pub mod db;
+pub mod execution;
+pub mod indicators;
 pub mod llm;
+pub mod models;
 pub mod persistence;
+pub mod risk;
+pub mod strategy;
 
 // Re-export commonly used types
-pub use models::*;
 pub use api::*;
+pub use models::*;
 pub use strategy::Strategy;
 
 // Error handling

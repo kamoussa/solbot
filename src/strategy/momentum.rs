@@ -1,4 +1,7 @@
-use super::{Strategy, signals::{SignalConfig, analyze_market_conditions, validate_candle_uniformity}};
+use super::{
+    signals::{analyze_market_conditions, validate_candle_uniformity, SignalConfig},
+    Strategy,
+};
 use crate::models::{Candle, Signal};
 use crate::Result;
 
@@ -36,8 +39,11 @@ impl MomentumStrategy {
     ///
     /// # Example
     /// ```
+    /// use cryptobot::strategy::momentum::MomentumStrategy;
+    ///
+    /// let strategy = MomentumStrategy::default();
     /// // 24hr lookback, 30min polling = 48 samples needed
-    /// strategy.samples_needed(30); // Returns 48
+    /// assert_eq!(strategy.samples_needed(30), 48);
     /// ```
     pub fn samples_needed(&self, poll_interval_minutes: u64) -> usize {
         self.config.samples_needed(poll_interval_minutes)
@@ -97,6 +103,14 @@ impl Strategy for MomentumStrategy {
         // Need enough data for longest indicator (long MA + buffer)
         self.config.long_ma_period + 5
     }
+
+    fn samples_needed(&self, poll_interval_minutes: u64) -> usize {
+        self.config.samples_needed(poll_interval_minutes)
+    }
+
+    fn lookback_hours(&self) -> u64 {
+        self.config.lookback_hours
+    }
 }
 
 #[cfg(test)]
@@ -129,7 +143,10 @@ mod tests {
 
         let result = strategy.generate_signal(&candles);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Insufficient data"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Insufficient data"));
     }
 
     #[test]
@@ -206,13 +223,7 @@ mod tests {
 
         // Create sideways market (oscillating)
         let prices: Vec<f64> = (0..30)
-            .map(|i| {
-                if i % 2 == 0 {
-                    100.0
-                } else {
-                    102.0
-                }
-            })
+            .map(|i| if i % 2 == 0 { 100.0 } else { 102.0 })
             .collect();
         let volumes = vec![1000.0; 30];
         let candles = create_test_candles(prices, volumes);

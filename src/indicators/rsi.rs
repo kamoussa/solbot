@@ -53,8 +53,8 @@ mod tests {
     fn test_rsi_calculation() {
         // Test with known values
         let prices = vec![
-            44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.5, 45.25, 45.5,
-            46.0, 46.5, 46.25, 46.0, 46.5,
+            44.0, 44.25, 44.5, 43.75, 44.0, 44.5, 45.0, 45.5, 45.25, 45.5, 46.0, 46.5, 46.25, 46.0,
+            46.5,
         ];
 
         let rsi = calculate_rsi(&prices, 14);
@@ -76,6 +76,6 @@ mod tests {
         let prices = vec![100.0, 101.0, 102.0, 103.0, 104.0, 105.0];
         let rsi = calculate_rsi(&prices, 5);
         assert!(rsi.is_some());
-        assert_eq!(rsi.unwrap(), 100.0);  // All gains = RSI 100
+        assert_eq!(rsi.unwrap(), 100.0); // All gains = RSI 100
     }
 }

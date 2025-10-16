@@ -489,6 +489,7 @@ dependencies = [
  "config",
  "dotenvy",
  "mockito",
+ "rand 0.8.5",
  "redis",
  "reqwest",
  "rust_decimal",

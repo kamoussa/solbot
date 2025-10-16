@@ -1,7 +1,7 @@
-use crate::execution::{Position, PositionStatus, ExitReason};
+use crate::execution::{ExitReason, Position, PositionStatus};
 use crate::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use uuid::Uuid;
 
 /// Default user ID for single-user mode
@@ -67,7 +67,7 @@ impl PostgresPersistence {
                 exit_time = EXCLUDED.exit_time,
                 exit_reason = EXCLUDED.exit_reason,
                 updated_at = NOW()
-            "#
+            "#,
         )
         .bind(position.id)
         .bind(self.user_id)
@@ -86,7 +86,11 @@ impl PostgresPersistence {
         .execute(&self.pool)
         .await?;
 
-        tracing::debug!("Saved position {} for {} to Postgres", position.id, position.token);
+        tracing::debug!(
+            "Saved position {} for {} to Postgres",
+            position.id,
+            position.token
+        );
 
         Ok(())
     }
@@ -101,7 +105,7 @@ impl PostgresPersistence {
             FROM positions
             WHERE user_id = $1
             ORDER BY entry_time ASC
-            "#
+            "#,
         )
         .bind(self.user_id)
         .fetch_all(&self.pool)
@@ -173,7 +177,7 @@ impl PostgresPersistence {
             FROM positions
             WHERE user_id = $1 AND entry_time >= $2
             ORDER BY entry_time ASC
-            "#
+            "#,
         )
         .bind(self.user_id)
         .bind(cutoff)
@@ -229,7 +233,11 @@ impl PostgresPersistence {
             });
         }
 
-        tracing::info!("Loaded {} positions from last {} days", positions.len(), days);
+        tracing::info!(
+            "Loaded {} positions from last {} days",
+            positions.len(),
+            days
+        );
 
         Ok(positions)
     }
@@ -241,7 +249,7 @@ impl PostgresPersistence {
             SELECT COALESCE(SUM(realized_pnl), 0) as total_pnl
             FROM positions
             WHERE user_id = $1 AND status = 'Closed'
-            "#
+            "#,
         )
         .bind(self.user_id)
         .fetch_one(&self.pool)

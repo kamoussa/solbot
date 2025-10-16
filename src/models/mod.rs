@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Token {
     pub symbol: String,
-    pub mint_address: String,  // Solana mint address
+    pub mint_address: String, // Solana mint address
     pub name: String,
     pub decimals: u8,
 }
@@ -67,7 +67,7 @@ pub struct Position {
     pub quantity: f64,
     pub entry_time: DateTime<Utc>,
     pub stop_loss: f64,
-    pub take_profit: Option<f64>,  // None until trailing activated
+    pub take_profit: Option<f64>, // None until trailing activated
     pub status: PositionStatus,
 }
 
@@ -86,7 +86,7 @@ pub struct Trade {
     pub price: f64,
     pub quantity: f64,
     pub timestamp: DateTime<Utc>,
-    pub tx_signature: Option<String>,  // Solana transaction signature
+    pub tx_signature: Option<String>, // Solana transaction signature
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,7 +120,7 @@ mod tests {
             entry_price: 100.0,
             quantity: 10.0,
             entry_time: Utc::now(),
-            stop_loss: 92.0,  // -8% stop loss
+            stop_loss: 92.0, // -8% stop loss
             take_profit: None,
             status: PositionStatus::Open,
         };

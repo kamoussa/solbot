@@ -1,5 +1,5 @@
-use crate::models::{Candle, Signal};
 use crate::indicators::{calculate_rsi, calculate_sma};
+use crate::models::{Candle, Signal};
 
 /// Configuration for signal generation
 #[derive(Debug, Clone)]
@@ -38,8 +38,11 @@ impl SignalConfig {
     ///
     /// # Example
     /// ```
+    /// use cryptobot::strategy::signals::SignalConfig;
+    ///
+    /// let config = SignalConfig::default();
     /// // 24 hour lookback, polling every 30 min = 48 samples
-    /// config.samples_needed(30) // Returns 48
+    /// assert_eq!(config.samples_needed(30), 48);
     /// ```
     pub fn samples_needed(&self, poll_interval_minutes: u64) -> usize {
         let lookback_minutes = self.lookback_hours * 60;
@@ -126,7 +129,11 @@ pub fn analyze_market_conditions(
     // Log indicators for debugging
     tracing::debug!(
         "Indicators: RSI={:.1}, Short MA={:.4}, Long MA={:.4}, Price={:.4}, Vol Ratio={:.2}x",
-        rsi, short_ma, long_ma, current_price, volume_ratio
+        rsi,
+        short_ma,
+        long_ma,
+        current_price,
+        volume_ratio
     );
 
     // Check buy conditions
@@ -145,19 +152,26 @@ pub fn analyze_market_conditions(
     let signal = if buy_count >= 3 {
         tracing::info!(
             "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
-            rsi_condition, ma_crossover, price_above_ma, volume_spike, buy_count
+            rsi_condition,
+            ma_crossover,
+            price_above_ma,
+            volume_spike,
+            buy_count
         );
         Signal::Buy
     } else if rsi_overbought && ma_crossunder {
         tracing::info!(
             "SELL conditions: RSI>70={}, MA↓={} (both required)",
-            rsi_overbought, ma_crossunder
+            rsi_overbought,
+            ma_crossunder
         );
         Signal::Sell
     } else {
         tracing::debug!(
             "HOLD: Buy {}/4, Sell RSI>70={} MA↓={}",
-            buy_count, rsi_overbought, ma_crossunder
+            buy_count,
+            rsi_overbought,
+            ma_crossunder
         );
         Signal::Hold
     };
@@ -197,8 +211,8 @@ mod tests {
     #[test]
     fn test_gap_detected() {
         let candles = vec![
-            create_test_candle(60),  // 60 min ago
-            create_test_candle(5),   // 5 min ago - 55 min gap!
+            create_test_candle(60), // 60 min ago
+            create_test_candle(5),  // 5 min ago - 55 min gap!
             create_test_candle(0),
         ];
 
@@ -211,7 +225,7 @@ mod tests {
     fn test_backwards_timestamps_fail() {
         let candles = vec![
             create_test_candle(0),
-            create_test_candle(5),  // Backwards!
+            create_test_candle(5), // Backwards!
         ];
 
         let result = validate_candle_uniformity(&candles, 300);
@@ -229,8 +243,8 @@ mod tests {
     #[test]
     fn test_tolerance_allows_slight_variation() {
         let candles = vec![
-            create_test_candle(13),  // 13 min ago
-            create_test_candle(6),   // 6 min ago (7 min gap, within 50% tolerance of 5 min)
+            create_test_candle(13), // 13 min ago
+            create_test_candle(6),  // 6 min ago (7 min gap, within 50% tolerance of 5 min)
             create_test_candle(0),
         ];
 
@@ -242,14 +256,13 @@ mod tests {
     fn test_signal_generation_buy() {
         // Uptrend with volume spike
         let prices = vec![
-            100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 114.0,
-            116.0, 118.0, 120.0, 122.0, 124.0, 126.0, 128.0, 130.0,
-            132.0, 134.0, 136.0, 138.0, 140.0,
+            100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 114.0, 116.0, 118.0, 120.0, 122.0,
+            124.0, 126.0, 128.0, 130.0, 132.0, 134.0, 136.0, 138.0, 140.0,
         ];
         let volumes = vec![
-            1000.0, 1100.0, 1200.0, 1300.0, 1400.0, 1500.0, 1600.0, 1700.0,
-            1800.0, 1900.0, 2000.0, 2100.0, 2200.0, 2300.0, 2400.0, 2500.0,
-            2600.0, 2700.0, 2800.0, 2900.0, 5000.0, // Volume spike
+            1000.0, 1100.0, 1200.0, 1300.0, 1400.0, 1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2000.0,
+            2100.0, 2200.0, 2300.0, 2400.0, 2500.0, 2600.0, 2700.0, 2800.0, 2900.0,
+            5000.0, // Volume spike
         ];
 
         let config = SignalConfig::default();

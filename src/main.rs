@@ -49,8 +49,8 @@ async fn main() -> Result<()> {
     let mut price_manager = PriceFeedManager::new(tokens.clone(), buffer_size);
 
     // Initialize Redis persistence for candles
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     let mut redis_persistence = match RedisPersistence::new(&redis_url).await {
         Ok(p) => {
@@ -58,7 +58,10 @@ async fn main() -> Result<()> {
             Some(p)
         }
         Err(e) => {
-            tracing::warn!("Failed to connect to Redis ({}), continuing without candle persistence", e);
+            tracing::warn!(
+                "Failed to connect to Redis ({}), continuing without candle persistence",
+                e
+            );
             None
         }
     };
@@ -69,11 +72,17 @@ async fn main() -> Result<()> {
 
     let mut postgres_persistence = match PostgresPersistence::new(&database_url, None).await {
         Ok(p) => {
-            tracing::info!("Postgres persistence enabled at {} (positions)", database_url);
+            tracing::info!(
+                "Postgres persistence enabled at {} (positions)",
+                database_url
+            );
             Some(p)
         }
         Err(e) => {
-            tracing::warn!("Failed to connect to Postgres ({}), continuing without position persistence", e);
+            tracing::warn!(
+                "Failed to connect to Postgres ({}), continuing without position persistence",
+                e
+            );
             None
         }
     };
@@ -97,12 +106,19 @@ async fn main() -> Result<()> {
         tracing::info!("Loading historical candle data from Redis...");
 
         for token in &tokens {
-            match redis_persistence.load_candles(&token.symbol, strategy.lookback_hours()).await {
+            match redis_persistence
+                .load_candles(&token.symbol, strategy.lookback_hours())
+                .await
+            {
                 Ok(historical) => {
                     if !historical.is_empty() {
                         for candle in &historical {
                             if let Err(e) = price_manager.buffer().add_candle(candle.clone()) {
-                                tracing::warn!("Failed to add historical candle for {}: {}", token.symbol, e);
+                                tracing::warn!(
+                                    "Failed to add historical candle for {}: {}",
+                                    token.symbol,
+                                    e
+                                );
                             }
                         }
                         tracing::info!(
@@ -129,7 +145,8 @@ async fn main() -> Result<()> {
 
     let circuit_breakers = CircuitBreakers::default();
 
-    tracing::info!("Portfolio: ${:.2} | Circuit Breakers: max_daily_loss={}%, max_drawdown={}%",
+    tracing::info!(
+        "Portfolio: ${:.2} | Circuit Breakers: max_daily_loss={}%, max_drawdown={}%",
         initial_portfolio_value,
         circuit_breakers.max_daily_loss_pct * 100.0,
         circuit_breakers.max_drawdown_pct * 100.0
@@ -158,13 +175,11 @@ async fn main() -> Result<()> {
     };
 
     // Create PositionManager with loaded state or fresh
-    let position_manager = Arc::new(Mutex::new(
-        if let Some(positions) = loaded_positions {
-            PositionManager::with_positions(initial_portfolio_value, circuit_breakers, positions)
-        } else {
-            PositionManager::new(initial_portfolio_value, circuit_breakers)
-        }
-    ));
+    let position_manager = Arc::new(Mutex::new(if let Some(positions) = loaded_positions {
+        PositionManager::with_positions(initial_portfolio_value, circuit_breakers, positions)
+    } else {
+        PositionManager::new(initial_portfolio_value, circuit_breakers)
+    }));
 
     let mut executor = Executor::new(position_manager.clone());
 
@@ -194,9 +209,27 @@ async fn main() -> Result<()> {
                     if let Some(ref mut redis_persistence) = redis_persistence {
                         if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
                             if let Some(latest_candle) = candles.last() {
-                                if let Err(e) = redis_persistence.save_candles(&token.symbol, &[latest_candle.clone()]).await {
-                                    tracing::warn!("Failed to save snapshot to Redis for {}: {}", token.symbol, e);
+                                match redis_persistence
+                                    .save_candles(&token.symbol, &[latest_candle.clone()])
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        tracing::debug!(
+                                            "Saved {} snapshot to Redis (total: {})",
+                                            token.symbol,
+                                            candles.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to save snapshot to Redis for {}: {}",
+                                            token.symbol,
+                                            e
+                                        );
+                                    }
                                 }
+                            } else {
+                                tracing::debug!("No candles in buffer yet for {}", token.symbol);
                             }
                         }
                     }
@@ -216,10 +249,15 @@ async fn main() -> Result<()> {
                         tracing::info!("✓ Position {} closed by exit condition", position_id);
 
                         // Save closed position to Postgres
-                        if let Some(position) = pm.all_positions().iter().find(|p| p.id == position_id) {
+                        if let Some(position) =
+                            pm.all_positions().iter().find(|p| p.id == position_id)
+                        {
                             if let Some(ref mut postgres_persistence) = postgres_persistence {
                                 if let Err(e) = postgres_persistence.save_position(position).await {
-                                    tracing::warn!("Failed to save closed position to Postgres: {}", e);
+                                    tracing::warn!(
+                                        "Failed to save closed position to Postgres: {}",
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -234,7 +272,8 @@ async fn main() -> Result<()> {
         // Process each token - generate signals and execute
         for token in &tokens {
             if let Some(&current_price) = prices.get(&token.symbol) {
-                let candles = price_manager.buffer()
+                let candles = price_manager
+                    .buffer()
                     .get_candles(&token.symbol)
                     .unwrap_or_default();
 
@@ -254,7 +293,11 @@ async fn main() -> Result<()> {
                             // Process signal with executor
                             match executor.process_signal(&signal, &token.symbol, current_price) {
                                 Ok(decision) => {
-                                    tracing::info!("  Decision: {:?} - {}", decision.action, decision.reason);
+                                    tracing::info!(
+                                        "  Decision: {:?} - {}",
+                                        decision.action,
+                                        decision.reason
+                                    );
 
                                     // Execute decision
                                     match decision.action {
@@ -270,21 +313,41 @@ async fn main() -> Result<()> {
 
                                             // Simulate opening the position
                                             let mut pm = position_manager.lock().unwrap();
-                                            match pm.open_position(token.symbol.clone(), current_price, quantity) {
+                                            match pm.open_position(
+                                                token.symbol.clone(),
+                                                current_price,
+                                                quantity,
+                                            ) {
                                                 Ok(position_id) => {
-                                                    tracing::info!("  ✓ Opened position {} for {}", position_id, token.symbol);
+                                                    tracing::info!(
+                                                        "  ✓ Opened position {} for {}",
+                                                        position_id,
+                                                        token.symbol
+                                                    );
 
                                                     // Save position to Postgres
-                                                    if let Some(position) = pm.all_positions().iter().find(|p| p.id == position_id) {
-                                                        if let Some(ref mut postgres_persistence) = postgres_persistence {
-                                                            if let Err(e) = postgres_persistence.save_position(position).await {
+                                                    if let Some(position) = pm
+                                                        .all_positions()
+                                                        .iter()
+                                                        .find(|p| p.id == position_id)
+                                                    {
+                                                        if let Some(ref mut postgres_persistence) =
+                                                            postgres_persistence
+                                                        {
+                                                            if let Err(e) = postgres_persistence
+                                                                .save_position(position)
+                                                                .await
+                                                            {
                                                                 tracing::warn!("Failed to save position to Postgres: {}", e);
                                                             }
                                                         }
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!("  ✗ Failed to open position: {}", e);
+                                                    tracing::error!(
+                                                        "  ✗ Failed to open position: {}",
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }
@@ -304,16 +367,28 @@ async fn main() -> Result<()> {
                                                     );
 
                                                     // Save updated position to Postgres
-                                                    if let Some(position) = pm.all_positions().iter().find(|p| p.id == position_id) {
-                                                        if let Some(ref mut postgres_persistence) = postgres_persistence {
-                                                            if let Err(e) = postgres_persistence.save_position(position).await {
+                                                    if let Some(position) = pm
+                                                        .all_positions()
+                                                        .iter()
+                                                        .find(|p| p.id == position_id)
+                                                    {
+                                                        if let Some(ref mut postgres_persistence) =
+                                                            postgres_persistence
+                                                        {
+                                                            if let Err(e) = postgres_persistence
+                                                                .save_position(position)
+                                                                .await
+                                                            {
                                                                 tracing::warn!("Failed to save closed position to Postgres: {}", e);
                                                             }
                                                         }
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!("  ✗ Failed to close position: {}", e);
+                                                    tracing::error!(
+                                                        "  ✗ Failed to close position: {}",
+                                                        e
+                                                    );
                                                 }
                                             }
                                         }
@@ -345,12 +420,15 @@ async fn main() -> Result<()> {
         // Log portfolio state
         {
             let pm = position_manager.lock().unwrap();
-            let portfolio_value = pm.portfolio_value(&prices).unwrap_or(initial_portfolio_value);
+            let portfolio_value = pm
+                .portfolio_value(&prices)
+                .unwrap_or(initial_portfolio_value);
             let open_positions = pm.open_positions();
 
             tracing::info!("\n📊 Portfolio Summary:");
             tracing::info!("  Value: ${:.2}", portfolio_value);
-            tracing::info!("  P&L: ${:.2} ({:.2}%)",
+            tracing::info!(
+                "  P&L: ${:.2} ({:.2}%)",
                 portfolio_value - initial_portfolio_value,
                 ((portfolio_value - initial_portfolio_value) / initial_portfolio_value) * 100.0
             );
@@ -359,7 +437,8 @@ async fn main() -> Result<()> {
             for position in open_positions {
                 if let Some(&current_price) = prices.get(&position.token) {
                     let unrealized_pnl = (current_price - position.entry_price) * position.quantity;
-                    let unrealized_pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100.0;
+                    let unrealized_pnl_pct =
+                        ((current_price - position.entry_price) / position.entry_price) * 100.0;
                     tracing::info!(
                         "    {} | Entry: ${:.4} | Current: ${:.4} | P&L: ${:.2} ({:.2}%)",
                         position.token,

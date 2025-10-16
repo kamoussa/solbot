@@ -1,7 +1,7 @@
+use super::CandleBuffer;
 use crate::api::DexScreenerClient;
 use crate::models::{PriceSnapshot, Token};
 use crate::Result;
-use super::CandleBuffer;
 use chrono::Utc;
 
 /// Manages price data collection for multiple tokens
@@ -126,14 +126,12 @@ mod tests {
     #[tokio::test]
     #[ignore] // Requires live API
     async fn test_fetch_all_live() {
-        let tokens = vec![
-            Token {
-                symbol: "SOL".to_string(),
-                mint_address: "So11111111111111111111111111111111111111112".to_string(),
-                name: "Solana".to_string(),
-                decimals: 9,
-            },
-        ];
+        let tokens = vec![Token {
+            symbol: "SOL".to_string(),
+            mint_address: "So11111111111111111111111111111111111111112".to_string(),
+            name: "Solana".to_string(),
+            decimals: 9,
+        }];
 
         let mut manager = PriceFeedManager::new(tokens, 100);
         let results = manager.fetch_all().await;
@@ -151,4 +149,3 @@ mod tests {
         assert_eq!(buffer.candle_count("SOL").unwrap(), 0);
     }
 }
-

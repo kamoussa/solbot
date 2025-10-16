@@ -1,9 +1,9 @@
 use crate::models::Candle;
 use crate::Result;
+use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
 use tokio::time::{timeout, Duration};
 
 /// Simple snapshot for Redis storage
@@ -28,7 +28,9 @@ impl RedisPersistence {
     /// * `redis_url` - Redis connection URL (e.g., "redis://127.0.0.1:6379")
     ///
     /// # Example
-    /// ```
+    /// ```ignore
+    /// use cryptobot::persistence::RedisPersistence;
+    ///
     /// let persistence = RedisPersistence::new("redis://127.0.0.1:6379").await?;
     /// ```
     pub async fn new(redis_url: &str) -> Result<Self> {
@@ -84,9 +86,7 @@ impl RedisPersistence {
         let min_score = cutoff.timestamp() as f64;
 
         // Get all snapshots after cutoff
-        let results: Vec<String> = self.conn
-            .zrangebyscore(&key, min_score, "+inf")
-            .await?;
+        let results: Vec<String> = self.conn.zrangebyscore(&key, min_score, "+inf").await?;
 
         let mut candles = Vec::new();
 
@@ -104,7 +104,11 @@ impl RedisPersistence {
             });
         }
 
-        tracing::info!("Loaded {} historical candles for {} from Redis", candles.len(), token);
+        tracing::info!(
+            "Loaded {} historical candles for {} from Redis",
+            candles.len(),
+            token
+        );
 
         Ok(candles)
     }
@@ -118,9 +122,7 @@ impl RedisPersistence {
         let cutoff = Utc::now() - chrono::Duration::hours(keep_hours as i64);
         let max_score = cutoff.timestamp() as f64;
 
-        let removed: usize = self.conn
-            .zrembyscore(&key, "-inf", max_score)
-            .await?;
+        let removed: usize = self.conn.zrembyscore(&key, "-inf", max_score).await?;
 
         if removed > 0 {
             tracing::debug!("Cleaned up {} old snapshots for {}", removed, token);
@@ -172,7 +174,10 @@ mod tests {
         let _ = persistence.cleanup_old("TEST_SINGLE", 0).await;
 
         let candle = create_test_candle("TEST_SINGLE", 1, 100.0);
-        persistence.save_candles("TEST_SINGLE", &[candle.clone()]).await.unwrap();
+        persistence
+            .save_candles("TEST_SINGLE", &[candle.clone()])
+            .await
+            .unwrap();
 
         let loaded = persistence.load_candles("TEST_SINGLE", 24).await.unwrap();
 
@@ -200,7 +205,10 @@ mod tests {
             create_test_candle("TEST_MULTI", 1, 102.0),
         ];
 
-        persistence.save_candles("TEST_MULTI", &candles).await.unwrap();
+        persistence
+            .save_candles("TEST_MULTI", &candles)
+            .await
+            .unwrap();
 
         let loaded = persistence.load_candles("TEST_MULTI", 24).await.unwrap();
 
@@ -230,7 +238,10 @@ mod tests {
             create_test_candle("TEST_FILTER", 1, 102.0),  // 1 hour ago
         ];
 
-        persistence.save_candles("TEST_FILTER", &candles).await.unwrap();
+        persistence
+            .save_candles("TEST_FILTER", &candles)
+            .await
+            .unwrap();
 
         // Load only last 24 hours
         let loaded = persistence.load_candles("TEST_FILTER", 24).await.unwrap();
@@ -259,7 +270,10 @@ mod tests {
             create_test_candle("TEST_CLEANUP", 12, 101.0), // 12 hours ago
         ];
 
-        persistence.save_candles("TEST_CLEANUP", &candles).await.unwrap();
+        persistence
+            .save_candles("TEST_CLEANUP", &candles)
+            .await
+            .unwrap();
 
         // Cleanup anything older than 24 hours
         let removed = persistence.cleanup_old("TEST_CLEANUP", 24).await.unwrap();
@@ -293,7 +307,10 @@ mod tests {
             create_test_candle("TEST_COUNT", 1, 102.0),
         ];
 
-        persistence.save_candles("TEST_COUNT", &candles).await.unwrap();
+        persistence
+            .save_candles("TEST_COUNT", &candles)
+            .await
+            .unwrap();
 
         let count_after = persistence.count_snapshots("TEST_COUNT").await.unwrap();
         assert_eq!(count_after, 3);
@@ -309,10 +326,16 @@ mod tests {
             .await
             .expect("Failed to connect to Redis");
 
-        let loaded = persistence.load_candles("NONEXISTENT_TOKEN", 24).await.unwrap();
+        let loaded = persistence
+            .load_candles("NONEXISTENT_TOKEN", 24)
+            .await
+            .unwrap();
         assert_eq!(loaded.len(), 0);
 
-        let count = persistence.count_snapshots("NONEXISTENT_TOKEN").await.unwrap();
+        let count = persistence
+            .count_snapshots("NONEXISTENT_TOKEN")
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 }

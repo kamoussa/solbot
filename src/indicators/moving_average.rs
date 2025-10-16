@@ -51,6 +51,6 @@ mod tests {
         let prices = vec![100.0, 102.0, 104.0, 106.0, 108.0, 110.0];
         let ema = calculate_ema(&prices, 5);
         assert!(ema.is_some());
-        assert!(ema.unwrap() > 104.0);  // EMA should be above initial SMA
+        assert!(ema.unwrap() > 104.0); // EMA should be above initial SMA
     }
 }
