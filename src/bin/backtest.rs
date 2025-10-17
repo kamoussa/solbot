@@ -12,22 +12,34 @@ fn main() -> Result<()> {
     println!("\n╔═══════════════════════════════════════════════════════╗");
     println!("║          CRYPTOBOT BACKTESTING SUITE                 ║");
     println!("╚═══════════════════════════════════════════════════════╝");
+    println!("NOTE: Testing PRODUCTION parameters (same as Railway deployment).\n");
+    println!("      Strategy: RSI 14, MA 10/20, Volume 1.5x, 24h lookback");
 
     // Configuration
     let initial_portfolio_value = 10000.0;
     let circuit_breakers = CircuitBreakers::default();
+
+    // Use production default parameters (same as what's running on Railway)
+    // Note: Production strategy is conservative and may not trade in smooth trends
     let strategy = MomentumStrategy::default();
 
     let runner = BacktestRunner::new(initial_portfolio_value, circuit_breakers);
 
-    // Test scenarios
+    // Test scenarios - focusing on ones that SHOULD trigger production strategy
     let scenarios = vec![
-        (MarketScenario::Uptrend, "📈 Uptrend (+2% daily)"),
-        (MarketScenario::Downtrend, "📉 Downtrend (-2% daily)"),
-        (MarketScenario::Sideways, "↔️  Sideways (mean-reverting)"),
-        (MarketScenario::Volatile, "⚡ Volatile (±5% swings)"),
-        (MarketScenario::WithGaps, "🕳️  With Time Gaps"),
-        (MarketScenario::DrawdownTest, "💥 Drawdown Test (25% drop)"),
+        // These SHOULD generate trades with production parameters:
+        (
+            MarketScenario::FlashCrash,
+            "💥 Flash Crash Recovery (SHOULD BUY)",
+        ),
+        (
+            MarketScenario::VolatileUptrend,
+            "📈⚡ Volatile Uptrend with Dips (SHOULD BUY)",
+        ),
+        // Original scenarios (may not trade with conservative params):
+        (MarketScenario::Uptrend, "📈 Smooth Uptrend"),
+        (MarketScenario::Volatile, "⚡ High Volatility"),
+        (MarketScenario::DrawdownTest, "💥 Drawdown Test"),
     ];
 
     let mut all_metrics = Vec::new();

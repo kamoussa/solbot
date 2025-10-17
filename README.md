@@ -106,6 +106,25 @@ The bot automatically:
 
 ## Development
 
+### Using Just (recommended)
+```bash
+# Install just
+brew install just
+
+# See all available commands
+just
+
+# Pre-commit checks (format, clippy, tests)
+just pre-commit
+
+# Run all tests including integration
+just pre-push
+
+# Quick check (format + clippy only)
+just check
+```
+
+### Manual commands
 ```bash
 # Format & lint
 cargo fmt && cargo clippy

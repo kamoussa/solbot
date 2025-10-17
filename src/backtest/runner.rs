@@ -232,6 +232,7 @@ mod tests {
 
         let metrics = result.unwrap();
 
+        println!("Metrics: {:?}", metrics);
         // Note: The momentum strategy is intentionally conservative and may not trade
         // in smooth uptrends (requires RSI < 40 AND 3/4 conditions). This is expected
         // behavior and documented in README. The test verifies the backtest runs without
@@ -264,7 +265,7 @@ mod tests {
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
-
+        println!("Metrics: {:?}", metrics);
         // In downtrend, momentum strategy should generate fewer signals
         // May have 0 trades if it correctly identifies the downtrend
     }
@@ -313,6 +314,7 @@ mod tests {
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
+        println!("Metrics: {:?}", metrics);
 
         // With drawdown scenario and tight breakers, should hit them
         // (though this depends on strategy behavior)

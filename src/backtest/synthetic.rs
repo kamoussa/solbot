@@ -18,6 +18,10 @@ pub enum MarketScenario {
     WithGaps,
     /// Rapid drawdown to test circuit breakers
     DrawdownTest,
+    /// Flash crash recovery (sharp dip + bounce with volume) - SHOULD BUY
+    FlashCrash,
+    /// Volatile uptrend with deep pullbacks - SHOULD BUY on dips
+    VolatileUptrend,
 }
 
 /// Generates synthetic price data for backtesting
@@ -73,10 +77,16 @@ impl SyntheticDataGenerator {
             MarketScenario::DrawdownTest => {
                 self.generate_drawdown(start_time, num_candles, interval_minutes)
             }
+            MarketScenario::FlashCrash => {
+                self.generate_flash_crash(start_time, num_candles, interval_minutes)
+            }
+            MarketScenario::VolatileUptrend => {
+                self.generate_volatile_uptrend(start_time, num_candles, interval_minutes)
+            }
         }
     }
 
-    /// Generate uptrend: +2% daily with noise
+    /// Generate uptrend: +2% daily with noise and realistic pullbacks
     fn generate_uptrend(
         &mut self,
         start_time: DateTime<Utc>,
@@ -92,10 +102,18 @@ impl SyntheticDataGenerator {
         for i in 0..num_candles {
             let timestamp = start_time + Duration::minutes(i as i64 * interval_minutes);
 
-            // Apply drift + reduced noise so trend is dominant
+            // Add realistic pullbacks every ~50 candles (simulate profit-taking)
+            let pullback = if i % 50 == 25 {
+                // Small pullback (-1% over a few candles)
+                current_price * -0.005
+            } else {
+                0.0
+            };
+
+            // Apply drift + noise + pullbacks for realistic price action
             let drift = current_price * drift_per_interval;
-            let noise = current_price * self.rng.gen_range(-0.001..0.001); // ±0.1% noise
-            current_price += drift + noise;
+            let noise = current_price * self.rng.gen_range(-0.003..0.003); // ±0.3% noise (more realistic)
+            current_price += drift + noise + pullback;
 
             let candle = self.create_candle(current_price, timestamp);
             candles.push(candle);
@@ -251,8 +269,112 @@ impl SyntheticDataGenerator {
         candles
     }
 
+    /// Generate flash crash: Build up, sharp 15% crash, then V-recovery with volume
+    /// This should trigger BUY on the recovery (RSI oversold + MA cross + volume spike)
+    fn generate_flash_crash(
+        &mut self,
+        start_time: DateTime<Utc>,
+        num_candles: usize,
+        interval_minutes: i64,
+    ) -> Vec<Candle> {
+        let mut candles = Vec::with_capacity(num_candles);
+        let mut current_price = self.base_price;
+
+        for i in 0..num_candles {
+            let timestamp = start_time + Duration::minutes(i as i64 * interval_minutes);
+
+            // Phase 1 (0-40%): Gradual climb
+            // Phase 2 (40-50%): Sharp 15% crash over 10% of candles
+            // Phase 3 (50-100%): V-shaped recovery with high volume
+            let progress = i as f64 / num_candles as f64;
+
+            if progress < 0.4 {
+                // Gradual climb +0.5% per candle
+                current_price *= 1.005;
+            } else if progress < 0.5 {
+                // Sharp crash -15% over next 10%
+                current_price *= 0.985; // -1.5% per candle
+            } else {
+                // V-recovery +1% per candle
+                current_price *= 1.01;
+            }
+
+            let noise = current_price * self.rng.gen_range(-0.002..0.002);
+            current_price += noise;
+
+            // Higher volume during crash and recovery
+            let volume_multiplier = if (0.4..0.7).contains(&progress) {
+                2.0 // 2x volume during crash and early recovery
+            } else {
+                1.0
+            };
+
+            let candle =
+                self.create_candle_with_volume(current_price, timestamp, volume_multiplier);
+            candles.push(candle);
+        }
+
+        candles
+    }
+
+    /// Generate volatile uptrend: Overall uptrend but with sharp 15% pullbacks
+    /// This should trigger BUY on the pullbacks when RSI drops < 40
+    fn generate_volatile_uptrend(
+        &mut self,
+        start_time: DateTime<Utc>,
+        num_candles: usize,
+        interval_minutes: i64,
+    ) -> Vec<Candle> {
+        let mut candles = Vec::with_capacity(num_candles);
+        let mut current_price = self.base_price;
+
+        // Overall +3% daily drift
+        let drift_per_interval = 0.03 / (24.0 * 60.0 / interval_minutes as f64);
+
+        for i in 0..num_candles {
+            let timestamp = start_time + Duration::minutes(i as i64 * interval_minutes);
+
+            // Create sharp pullbacks every ~60 candles (5 hours at 5min intervals)
+            // Need 15-20% pullback to push RSI below 40
+            let cycle_position = i % 60;
+            let pullback = if (30..38).contains(&cycle_position) {
+                // Sharp 15% pullback over 8 candles (-1.875% per candle)
+                current_price * -0.01875
+            } else {
+                0.0
+            };
+
+            // Add volume spike during pullbacks (creates buy opportunities)
+            let volume_multiplier = if (30..45).contains(&cycle_position) {
+                2.0 // High volume during and after pullback
+            } else {
+                1.0
+            };
+
+            let drift = current_price * drift_per_interval;
+            let noise = current_price * self.rng.gen_range(-0.002..0.002);
+            current_price += drift + noise + pullback;
+
+            let candle =
+                self.create_candle_with_volume(current_price, timestamp, volume_multiplier);
+            candles.push(candle);
+        }
+
+        candles
+    }
+
     /// Helper to create a candle from price and timestamp
     fn create_candle(&mut self, price: f64, timestamp: DateTime<Utc>) -> Candle {
+        self.create_candle_with_volume(price, timestamp, 1.0)
+    }
+
+    /// Helper to create a candle with custom volume multiplier
+    fn create_candle_with_volume(
+        &mut self,
+        price: f64,
+        timestamp: DateTime<Utc>,
+        volume_multiplier: f64,
+    ) -> Candle {
         // Create realistic OHLC from close price
         let noise_pct = 0.002; // ±0.2% intrabar movement
 
@@ -264,8 +386,8 @@ impl SyntheticDataGenerator {
         let open_raw = price * (1.0 + self.rng.gen_range(-noise_pct..noise_pct));
         let open = open_raw.clamp(low, high);
 
-        // Vary volume ±30%
-        let volume = self.base_volume * self.rng.gen_range(0.7..1.3);
+        // Vary volume ±30% then apply multiplier
+        let volume = self.base_volume * self.rng.gen_range(0.7..1.3) * volume_multiplier;
 
         Candle {
             token: "SYNTH".to_string(),
