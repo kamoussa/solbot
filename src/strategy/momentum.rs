@@ -190,6 +190,11 @@ mod tests {
             long_ma_period: 15,
             volume_threshold: 2.0,
             lookback_hours: 12,
+            enable_panic_buy: false,
+            panic_rsi_threshold: 30.0,
+            panic_volume_multiplier: 2.0,
+            panic_price_drop_pct: 8.0,
+            panic_drop_window_candles: 12,
         };
 
         let strategy = MomentumStrategy::new(config);

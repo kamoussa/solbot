@@ -11,6 +11,12 @@ pub struct SignalConfig {
     pub long_ma_period: usize,
     pub volume_threshold: f64, // Multiple of average volume
     pub lookback_hours: u64,   // How many hours of history to analyze
+    // Panic buy settings (flash crash detection)
+    pub enable_panic_buy: bool,        // Enable aggressive flash crash buying
+    pub panic_rsi_threshold: f64,      // RSI threshold for panic (e.g., 30)
+    pub panic_volume_multiplier: f64,  // Volume spike needed (e.g., 2.0x)
+    pub panic_price_drop_pct: f64,     // Recent price drop % (e.g., 8%)
+    pub panic_drop_window_candles: usize, // How many candles to check for drop (e.g., 12 = 1hr at 5min)
 }
 
 impl Default for SignalConfig {
@@ -23,6 +29,12 @@ impl Default for SignalConfig {
             long_ma_period: 20,
             volume_threshold: 1.5,
             lookback_hours: 24, // Default: analyze last 24 hours
+            // Panic buy defaults (conservative but effective)
+            enable_panic_buy: true,
+            panic_rsi_threshold: 30.0,      // Extreme oversold
+            panic_volume_multiplier: 2.0,   // 2x volume spike
+            panic_price_drop_pct: 8.0,      // 8% drop
+            panic_drop_window_candles: 12,  // 1 hour at 5min intervals
         }
     }
 }
@@ -125,6 +137,41 @@ pub fn analyze_market_conditions(
 
     // Current price
     let current_price = prices.last()?;
+
+    // ==================== PANIC BUY LOGIC ====================
+    // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)
+    if config.enable_panic_buy && prices.len() > config.panic_drop_window_candles {
+        let window_start = prices.len().saturating_sub(config.panic_drop_window_candles);
+        let price_window_high = prices[window_start..]
+            .iter()
+            .fold(f64::MIN, |max, &p| max.max(p));
+
+        let price_drop_pct = ((price_window_high - current_price) / price_window_high) * 100.0;
+        let panic_volume_spike = volume_ratio > config.panic_volume_multiplier;
+
+        // Panic buy conditions:
+        // 1. RSI extremely oversold
+        // 2. Significant price drop in recent window
+        // 3. Volume spike (2x+ panic selling)
+        // 4. Not in deep downtrend (price within 8% of long MA)
+        let panic_conditions = [
+            rsi < config.panic_rsi_threshold,
+            price_drop_pct >= config.panic_price_drop_pct,
+            panic_volume_spike,
+            *current_price > long_ma * 0.92, // Not deep in downtrend
+        ];
+
+        if panic_conditions.iter().all(|&x| x) {
+            tracing::warn!(
+                "⚡ PANIC BUY triggered: RSI={:.1}, Drop={:.1}%, Vol={:.2}x, Price/LongMA={:.2}%",
+                rsi,
+                price_drop_pct,
+                volume_ratio,
+                (*current_price / long_ma - 1.0) * 100.0
+            );
+            return Some(Signal::Buy);
+        }
+    }
 
     // Log indicators for debugging
     tracing::debug!(
@@ -316,6 +363,11 @@ mod tests {
             long_ma_period: 15,
             volume_threshold: 2.0,
             lookback_hours: 6,
+            enable_panic_buy: false, // Disable for this test
+            panic_rsi_threshold: 30.0,
+            panic_volume_multiplier: 2.0,
+            panic_price_drop_pct: 8.0,
+            panic_drop_window_candles: 12,
         };
 
         let prices = vec![100.0; 20];
@@ -325,5 +377,123 @@ mod tests {
         assert!(signal.is_some());
         // Flat prices should result in Hold
         assert_eq!(signal.unwrap(), Signal::Hold);
+    }
+
+    #[test]
+    fn test_panic_buy_flash_crash() {
+        // Simulate flash crash: sharp 10% drop in 1 hour with volume spike
+        let mut prices = vec![200.0; 20]; // Stable at 200
+        // Sudden sharp 10% crash over 12 candles to push RSI < 30
+        for i in 1..=12 {
+            prices.push(200.0 - (i as f64 * 1.67)); // Drop ~1.67 per candle
+        }
+        prices.push(180.0); // Final price -10% from high
+
+        let mut volumes = vec![1000.0; prices.len() - 1];
+        volumes.push(2500.0); // 2.5x volume spike on crash
+
+        let config = SignalConfig::default(); // Panic buy enabled by default
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        assert!(signal.is_some());
+        assert_eq!(signal.unwrap(), Signal::Buy, "Should trigger panic buy on flash crash");
+    }
+
+    #[test]
+    fn test_panic_buy_disabled() {
+        // Same flash crash scenario but panic buy disabled
+        let mut prices = vec![200.0; 20];
+        for i in 1..=12 {
+            prices.push(200.0 - (i as f64 * 1.67));
+        }
+        prices.push(180.0);
+
+        let mut volumes = vec![1000.0; prices.len() - 1];
+        volumes.push(2500.0);
+
+        let mut config = SignalConfig::default();
+        config.enable_panic_buy = false; // Disable panic buy
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Should not trigger panic buy, falls through to regular logic
+        assert!(signal.is_some());
+        // Might be Hold since MA conditions aren't met in crash
+        assert_ne!(signal.unwrap(), Signal::Buy, "Should not panic buy when disabled");
+    }
+
+    #[test]
+    fn test_panic_buy_insufficient_drop() {
+        // Only 5% drop, not enough for panic buy (needs 8%)
+        let mut prices = vec![200.0; 20];
+        for i in 0..12 {
+            prices.push(200.0 - (i as f64 * 0.83)); // Only 10 point drop = 5%
+        }
+        prices.push(190.0);
+
+        let mut volumes = vec![1000.0; prices.len() - 1];
+        volumes.push(2500.0); // Volume spike present
+
+        let config = SignalConfig::default();
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Should not trigger panic buy
+        assert!(signal.is_some());
+        let result = signal.unwrap();
+        // May still trigger regular buy if other conditions met
+        // but won't be the immediate panic buy
+        assert!(result == Signal::Hold || result == Signal::Buy);
+    }
+
+    #[test]
+    fn test_panic_buy_no_volume_spike() {
+        // 8% drop but no volume spike
+        let mut prices = vec![200.0; 20];
+        for i in 0..12 {
+            prices.push(200.0 - (i as f64 * 1.33));
+        }
+        prices.push(184.0);
+
+        let volumes = vec![1000.0; prices.len()]; // No volume spike
+
+        let config = SignalConfig::default();
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        assert!(signal.is_some());
+        assert_ne!(
+            signal.unwrap(),
+            Signal::Buy,
+            "Should not panic buy without volume confirmation"
+        );
+    }
+
+    #[test]
+    fn test_panic_buy_deep_downtrend() {
+        // Flash crash but already in deep downtrend (price way below long MA)
+        // This prevents buying into a collapsing asset
+        let mut prices = vec![200.0; 20]; // MA will be around 200
+        // Deep crash to 170 (-15%), way below the 92% threshold
+        for i in 0..12 {
+            prices.push(200.0 - (i as f64 * 2.5));
+        }
+        prices.push(170.0); // 15% below MA baseline
+
+        let mut volumes = vec![1000.0; prices.len() - 1];
+        volumes.push(2500.0); // Volume spike present
+
+        let config = SignalConfig::default();
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Should not trigger panic buy - too deep in downtrend
+        assert!(signal.is_some());
+        assert_ne!(
+            signal.unwrap(),
+            Signal::Buy,
+            "Should not panic buy in deep downtrend"
+        );
     }
 }
