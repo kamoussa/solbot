@@ -316,7 +316,7 @@ impl PostgresPersistence {
             SELECT symbol, address, name
             FROM tracked_tokens
             WHERE status = 'active'
-            ORDER BY discovery_rank ASC
+            ORDER BY created_at ASC
             "#,
         )
         .fetch_all(&self.pool)
