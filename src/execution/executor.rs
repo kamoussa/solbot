@@ -206,8 +206,10 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_blocks_execution() {
-        let mut breakers = CircuitBreakers::default();
-        breakers.max_daily_loss_pct = 0.05;
+        let breakers = CircuitBreakers {
+            max_daily_loss_pct: 0.05,
+            ..Default::default()
+        };
 
         let pm = Arc::new(Mutex::new(PositionManager::new(10000.0, breakers)));
 

@@ -1,7 +1,6 @@
 use cryptobot::api::{DexScreenerClient, JupiterClient};
 use cryptobot::indicators::{calculate_rsi, calculate_sma};
 use cryptobot::risk::{CircuitBreakers, TradingState};
-use cryptobot::*;
 
 #[tokio::test]
 async fn test_e2e_workflow() {
@@ -340,7 +339,7 @@ async fn test_e2e_full_bot_simulation() {
                 if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
                     if let Some(latest) = candles.last() {
                         persistence
-                            .save_candles(&token.symbol, &[latest.clone()])
+                            .save_candles(&token.symbol, std::slice::from_ref(latest))
                             .await
                             .expect("Should save to Redis");
                     }

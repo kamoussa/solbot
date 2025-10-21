@@ -2,6 +2,7 @@
 pub mod api;
 pub mod backtest;
 pub mod db;
+pub mod discovery;
 pub mod execution;
 pub mod indicators;
 pub mod llm;

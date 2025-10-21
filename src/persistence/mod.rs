@@ -175,7 +175,7 @@ mod tests {
 
         let candle = create_test_candle("TEST_SINGLE", 1, 100.0);
         persistence
-            .save_candles("TEST_SINGLE", &[candle.clone()])
+            .save_candles("TEST_SINGLE", std::slice::from_ref(&candle))
             .await
             .unwrap();
 

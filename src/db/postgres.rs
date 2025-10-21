@@ -13,6 +13,14 @@ pub struct PostgresPersistence {
     user_id: Uuid,
 }
 
+/// Data for saving a tracked token (SYSTEM-LEVEL)
+pub struct TrackedTokenData<'a> {
+    pub symbol: &'a str,
+    pub address: &'a str,
+    pub name: &'a str,
+    pub strategy_type: &'a str,
+}
+
 impl PostgresPersistence {
     /// Connect to Postgres
     ///
@@ -264,6 +272,74 @@ impl PostgresPersistence {
     pub async fn clear_all_positions(&self) -> Result<()> {
         sqlx::query("DELETE FROM positions WHERE user_id = $1")
             .bind(self.user_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Save tracked token to database (SYSTEM-LEVEL)
+    /// If token already exists (same address), updates it
+    pub async fn save_tracked_token(&self, data: TrackedTokenData<'_>) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO tracked_tokens (symbol, address, name, strategy_type, status)
+            VALUES ($1, $2, $3, $4, 'active')
+            ON CONFLICT (address) DO UPDATE SET
+                symbol = EXCLUDED.symbol,
+                name = EXCLUDED.name,
+                strategy_type = EXCLUDED.strategy_type,
+                status = 'active',
+                updated_at = NOW()
+            "#,
+        )
+        .bind(data.symbol)
+        .bind(data.address)
+        .bind(data.name)
+        .bind(data.strategy_type)
+        .execute(&self.pool)
+        .await?;
+
+        tracing::debug!(
+            "Saved tracked token {} ({}) to Postgres",
+            data.symbol,
+            data.address
+        );
+
+        Ok(())
+    }
+
+    /// Load all active tracked tokens (SYSTEM-LEVEL)
+    pub async fn load_tracked_tokens(&self) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT symbol, address, name
+            FROM tracked_tokens
+            WHERE status = 'active'
+            ORDER BY discovery_rank ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tokens = Vec::new();
+
+        for row in rows {
+            let symbol: String = row.get("symbol");
+            let address: String = row.get("address");
+            let name: String = row.get("name");
+            tokens.push((symbol, address, name));
+        }
+
+        tracing::info!("Loaded {} tracked tokens from Postgres", tokens.len());
+
+        Ok(tokens)
+    }
+
+    /// Delete all tracked tokens (testing only)
+    #[cfg(test)]
+    pub async fn clear_all_tracked_tokens(&self) -> Result<()> {
+        sqlx::query("DELETE FROM tracked_tokens")
             .execute(&self.pool)
             .await?;
 

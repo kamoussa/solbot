@@ -12,10 +12,10 @@ pub struct SignalConfig {
     pub volume_threshold: f64, // Multiple of average volume
     pub lookback_hours: u64,   // How many hours of history to analyze
     // Panic buy settings (flash crash detection)
-    pub enable_panic_buy: bool,        // Enable aggressive flash crash buying
-    pub panic_rsi_threshold: f64,      // RSI threshold for panic (e.g., 30)
-    pub panic_volume_multiplier: f64,  // Volume spike needed (e.g., 2.0x)
-    pub panic_price_drop_pct: f64,     // Recent price drop % (e.g., 8%)
+    pub enable_panic_buy: bool,   // Enable aggressive flash crash buying
+    pub panic_rsi_threshold: f64, // RSI threshold for panic (e.g., 30)
+    pub panic_volume_multiplier: f64, // Volume spike needed (e.g., 2.0x)
+    pub panic_price_drop_pct: f64, // Recent price drop % (e.g., 8%)
     pub panic_drop_window_candles: usize, // How many candles to check for drop (e.g., 12 = 1hr at 5min)
 }
 
@@ -31,10 +31,10 @@ impl Default for SignalConfig {
             lookback_hours: 24, // Default: analyze last 24 hours
             // Panic buy defaults (conservative but effective)
             enable_panic_buy: true,
-            panic_rsi_threshold: 30.0,      // Extreme oversold
-            panic_volume_multiplier: 2.0,   // 2x volume spike
-            panic_price_drop_pct: 8.0,      // 8% drop
-            panic_drop_window_candles: 12,  // 1 hour at 5min intervals
+            panic_rsi_threshold: 30.0,     // Extreme oversold
+            panic_volume_multiplier: 2.0,  // 2x volume spike
+            panic_price_drop_pct: 8.0,     // 8% drop
+            panic_drop_window_candles: 12, // 1 hour at 5min intervals
         }
     }
 }
@@ -141,7 +141,9 @@ pub fn analyze_market_conditions(
     // ==================== PANIC BUY LOGIC ====================
     // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)
     if config.enable_panic_buy && prices.len() > config.panic_drop_window_candles {
-        let window_start = prices.len().saturating_sub(config.panic_drop_window_candles);
+        let window_start = prices
+            .len()
+            .saturating_sub(config.panic_drop_window_candles);
         let price_window_high = prices[window_start..]
             .iter()
             .fold(f64::MIN, |max, &p| max.max(p));
@@ -383,7 +385,7 @@ mod tests {
     fn test_panic_buy_flash_crash() {
         // Simulate flash crash: sharp 10% drop in 1 hour with volume spike
         let mut prices = vec![200.0; 20]; // Stable at 200
-        // Sudden sharp 10% crash over 12 candles to push RSI < 30
+                                          // Sudden sharp 10% crash over 12 candles to push RSI < 30
         for i in 1..=12 {
             prices.push(200.0 - (i as f64 * 1.67)); // Drop ~1.67 per candle
         }
@@ -397,7 +399,11 @@ mod tests {
         let signal = analyze_market_conditions(&prices, &volumes, &config);
 
         assert!(signal.is_some());
-        assert_eq!(signal.unwrap(), Signal::Buy, "Should trigger panic buy on flash crash");
+        assert_eq!(
+            signal.unwrap(),
+            Signal::Buy,
+            "Should trigger panic buy on flash crash"
+        );
     }
 
     #[test]
@@ -412,15 +418,21 @@ mod tests {
         let mut volumes = vec![1000.0; prices.len() - 1];
         volumes.push(2500.0);
 
-        let mut config = SignalConfig::default();
-        config.enable_panic_buy = false; // Disable panic buy
+        let config = SignalConfig {
+            enable_panic_buy: false, // Disable panic buy
+            ..Default::default()
+        };
 
         let signal = analyze_market_conditions(&prices, &volumes, &config);
 
         // Should not trigger panic buy, falls through to regular logic
         assert!(signal.is_some());
         // Might be Hold since MA conditions aren't met in crash
-        assert_ne!(signal.unwrap(), Signal::Buy, "Should not panic buy when disabled");
+        assert_ne!(
+            signal.unwrap(),
+            Signal::Buy,
+            "Should not panic buy when disabled"
+        );
     }
 
     #[test]
@@ -475,7 +487,7 @@ mod tests {
         // Flash crash but already in deep downtrend (price way below long MA)
         // This prevents buying into a collapsing asset
         let mut prices = vec![200.0; 20]; // MA will be around 200
-        // Deep crash to 170 (-15%), way below the 92% threshold
+                                          // Deep crash to 170 (-15%), way below the 92% threshold
         for i in 0..12 {
             prices.push(200.0 - (i as f64 * 2.5));
         }
