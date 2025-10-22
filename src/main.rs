@@ -8,6 +8,7 @@ use cryptobot::models::Token;
 use cryptobot::persistence::RedisPersistence;
 use cryptobot::risk::CircuitBreakers;
 use cryptobot::strategy::momentum::MomentumStrategy;
+use cryptobot::strategy::signals::validate_candle_uniformity;
 use cryptobot::strategy::Strategy;
 use cryptobot::Result;
 use chrono::{Timelike, Utc};
@@ -285,12 +286,12 @@ async fn discover_and_build_token_list(
     tracing::info!("✅ {} safe tokens passed filter", safe_tokens.len());
 
     // Build final list
-    build_final_token_list(birdeye_client, existing_tracked, safe_tokens).await
+    build_final_token_list(existing_tracked, safe_tokens).await
 }
 
 async fn load_existing_tracked_tokens(
     postgres: Option<&PostgresPersistence>,
-) -> Vec<(String, String, String)> {
+) -> Vec<(String, String, String, u8)> {
     let postgres = match postgres {
         Some(p) => p,
         None => return Vec::new(),
@@ -343,8 +344,7 @@ fn apply_safety_filter(trending_tokens: &[TrendingToken]) -> Vec<&TrendingToken>
 }
 
 async fn build_final_token_list(
-    birdeye_client: &BirdeyeClient,
-    existing_tracked: Vec<(String, String, String)>,
+    existing_tracked: Vec<(String, String, String, u8)>,
     safe_tokens: Vec<&TrendingToken>,
 ) -> Result<Vec<TrendingToken>> {
     let mut final_tokens = Vec::new();
@@ -352,7 +352,6 @@ async fn build_final_token_list(
 
     // Restore existing tracked tokens
     restore_existing_tokens(
-        birdeye_client,
         &existing_tracked,
         &safe_tokens,
         &mut final_tokens,
@@ -362,7 +361,6 @@ async fn build_final_token_list(
 
     // Add must-track tokens
     add_must_track_tokens(
-        birdeye_client,
         &safe_tokens,
         &mut final_tokens,
         &mut tracked_addresses,
@@ -376,53 +374,103 @@ async fn build_final_token_list(
     Ok(final_tokens)
 }
 
+/// Restore all tokens we're already tracking
+///
+/// For tokens still in trending: use fresh data from API
+/// For tokens NOT in trending: use stored data from DB
+///
+/// **Important**: Tokens not in trending skip safety checks because they were
+/// already validated when first added. This is NOT fake data to fool the filter -
+/// these tokens have already passed safety checks and are being restored.
 async fn restore_existing_tokens(
-    birdeye_client: &BirdeyeClient,
-    existing_tracked: &[(String, String, String)],
+    existing_tracked: &[(String, String, String, u8)],
     safe_tokens: &[&TrendingToken],
     final_tokens: &mut Vec<TrendingToken>,
     tracked_addresses: &mut HashSet<String>,
 ) {
-    for (symbol, address, name) in existing_tracked {
-        // Try to find updated data in safe_tokens
+    for (symbol, address, name, decimals) in existing_tracked {
         if let Some(token) = safe_tokens.iter().find(|t| &t.address == address) {
+            // Token is still in trending - use fresh data
             final_tokens.push((*token).clone());
             tracked_addresses.insert(address.clone());
-            tracing::info!("✓ Keeping tracked token {} (found in discovery)", symbol);
+            tracing::info!("✓ Keeping {} (still in trending, using fresh data)", symbol);
         } else {
-            // Fetch fresh data for this token
-            if let Some(token) = fetch_token_data(birdeye_client, address, symbol, name).await {
-                final_tokens.push(token);
-                tracked_addresses.insert(address.clone());
-            }
+            // Token fell out of trending - keep tracking with stored data
+            // Market data fields are set to 0 since we don't have fresh data,
+            // but this token already passed safety checks when it was first added
+            let token = TrendingToken {
+                address: address.clone(),
+                symbol: symbol.clone(),
+                name: name.clone(),
+                decimals: *decimals,
+                liquidity_usd: 0.0,
+                volume_24h_usd: 0.0,
+                volume_24h_change_percent: 0.0,
+                fdv: 0.0,
+                rank: 9999, // Sentinel value indicating "not from trending"
+                price: 0.0,
+                price_24h_change_percent: 0.0,
+            };
+            final_tokens.push(token);
+            tracked_addresses.insert(address.clone());
+            tracing::info!(
+                "✓ Keeping {} (not in trending, using stored data - already validated)",
+                symbol
+            );
         }
     }
 }
 
+/// Add must-track tokens (SOL, JUP) to the tracking list
+///
+/// For tokens in trending: use fresh data from API
+/// For tokens NOT in trending: use hardcoded metadata
+///
+/// **Important**: Must-track tokens are pre-approved blue chips that skip safety
+/// checks entirely. They're always added regardless of trending status.
 async fn add_must_track_tokens(
-    birdeye_client: &BirdeyeClient,
     safe_tokens: &[&TrendingToken],
     final_tokens: &mut Vec<TrendingToken>,
     tracked_addresses: &mut HashSet<String>,
 ) {
     for (address, symbol) in MUST_TRACK {
         if tracked_addresses.contains(*address) {
-            continue; // Already added
+            continue; // Already added in restore_existing_tokens
         }
 
         if let Some(token) = safe_tokens
             .iter()
             .find(|t| &t.address == address || &t.symbol == symbol)
         {
+            // Token found in trending - use fresh data
             final_tokens.push((*token).clone());
             tracked_addresses.insert(address.to_string());
-            tracing::info!("✓ Must-track token {} found in discovery", symbol);
+            tracing::info!("✓ Must-track {} found in trending, using fresh data", symbol);
         } else {
-            // Fetch manually
-            if let Some(token) = fetch_must_track_token(birdeye_client, address, symbol).await {
-                final_tokens.push(token);
-                tracked_addresses.insert(address.to_string());
-            }
+            // Must-track token not in trending - add with hardcoded metadata
+            // This is unusual for blue chips like SOL/JUP but can happen
+            tracing::warn!(
+                "⚠ Must-track {} not in trending, adding with hardcoded data",
+                symbol
+            );
+
+            // Use known metadata for SOL and JUP (both use 9 decimals)
+            let token = TrendingToken {
+                address: address.to_string(),
+                symbol: symbol.to_string(),
+                name: if *symbol == "SOL" { "Solana" } else { "Jupiter" }.to_string(),
+                decimals: 9, // SOL and JUP both use 9 decimals
+                liquidity_usd: 0.0,
+                volume_24h_usd: 0.0,
+                volume_24h_change_percent: 0.0,
+                fdv: 0.0,
+                rank: 9999, // Sentinel value indicating "not from trending"
+                price: 0.0,
+                price_24h_change_percent: 0.0,
+            };
+            final_tokens.push(token);
+            tracked_addresses.insert(address.to_string());
+            tracing::info!("✓ Added must-track {} (pre-approved, skips safety checks)", symbol);
         }
     }
 }
@@ -444,88 +492,6 @@ fn add_new_safe_tokens(
     }
 }
 
-async fn fetch_token_data(
-    birdeye_client: &BirdeyeClient,
-    address: &str,
-    symbol: &str,
-    name: &str,
-) -> Option<TrendingToken> {
-    tracing::info!("📡 Fetching fresh data for tracked token {}...", symbol);
-
-    match birdeye_client.get_price(address).await {
-        Ok((price, liquidity)) => {
-            let token = TrendingToken {
-                address: address.to_string(),
-                symbol: symbol.to_string(),
-                name: name.to_string(),
-                decimals: 9,
-                liquidity_usd: liquidity.unwrap_or(0.0),
-                volume_24h_usd: 1_000_000.0,
-                volume_24h_change_percent: 0.0,
-                fdv: 10_000_000.0,
-                marketcap: 10_000_000.0,
-                rank: 999,
-                price,
-                price_24h_change_percent: 0.0,
-            };
-            tracing::info!(
-                "✓ Keeping tracked token {} (fetched at ${:.2})",
-                symbol,
-                price
-            );
-            Some(token)
-        }
-        Err(e) => {
-            tracing::warn!("⚠ Failed to fetch data for {}, skipping: {}", symbol, e);
-            None
-        }
-    }
-}
-
-async fn fetch_must_track_token(
-    birdeye_client: &BirdeyeClient,
-    address: &str,
-    symbol: &str,
-) -> Option<TrendingToken> {
-    tracing::warn!(
-        "⚠ Must-track token {} not found in discovery, fetching manually...",
-        symbol
-    );
-
-    match birdeye_client.get_price(address).await {
-        Ok((price, liquidity)) => {
-            let token = TrendingToken {
-                address: address.to_string(),
-                symbol: symbol.to_string(),
-                name: match symbol {
-                    "SOL" => "Solana".to_string(),
-                    "JUP" => "Jupiter".to_string(),
-                    _ => symbol.to_string(),
-                },
-                decimals: match symbol {
-                    "SOL" => 9,
-                    "JUP" => 6,
-                    _ => 9,
-                },
-                liquidity_usd: liquidity.unwrap_or(0.0),
-                volume_24h_usd: 1_000_000_000.0,
-                volume_24h_change_percent: 0.0,
-                fdv: 100_000_000_000.0,
-                marketcap: 100_000_000_000.0,
-                rank: 1,
-                price,
-                price_24h_change_percent: 0.0,
-            };
-            tracing::info!("✓ Manually added {} at ${:.2}", symbol, price);
-            Some(token)
-        }
-        Err(e) => {
-            tracing::error!("✗ Failed to fetch must-track token {}: {}", symbol, e);
-            None
-        }
-    }
-}
-
 async fn save_tracked_tokens_to_db(
     postgres: &mut PostgresPersistence,
     final_tokens: &[TrendingToken],
@@ -539,6 +505,7 @@ async fn save_tracked_tokens_to_db(
             symbol: &token.symbol,
             address: &token.address,
             name: &token.name,
+            decimals: token.decimals,
             strategy_type,
         };
 
@@ -719,6 +686,17 @@ async fn trading_execution_loop(
                 .await
             {
                 Ok(candles) => {
+                    // Validate candle uniformity early (fail fast)
+                    let expected_interval_secs = POLL_INTERVAL_MINUTES * 60;
+                    if let Err(e) = validate_candle_uniformity(&candles, expected_interval_secs) {
+                        tracing::warn!(
+                            "  {} - Skipping due to data quality issue: {}",
+                            token.symbol,
+                            e
+                        );
+                        continue;
+                    }
+
                     if let Some(latest) = candles.last() {
                         prices.insert(token.symbol.clone(), latest.close);
 

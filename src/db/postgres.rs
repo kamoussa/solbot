@@ -18,6 +18,7 @@ pub struct TrackedTokenData<'a> {
     pub symbol: &'a str,
     pub address: &'a str,
     pub name: &'a str,
+    pub decimals: u8,
     pub strategy_type: &'a str,
 }
 
@@ -283,11 +284,12 @@ impl PostgresPersistence {
     pub async fn save_tracked_token(&self, data: TrackedTokenData<'_>) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tracked_tokens (symbol, address, name, strategy_type, status)
-            VALUES ($1, $2, $3, $4, 'active')
+            INSERT INTO tracked_tokens (symbol, address, name, decimals, strategy_type, status)
+            VALUES ($1, $2, $3, $4, $5, 'active')
             ON CONFLICT (address) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
                 name = EXCLUDED.name,
+                decimals = EXCLUDED.decimals,
                 strategy_type = EXCLUDED.strategy_type,
                 status = 'active',
                 updated_at = NOW()
@@ -296,6 +298,7 @@ impl PostgresPersistence {
         .bind(data.symbol)
         .bind(data.address)
         .bind(data.name)
+        .bind(data.decimals as i16)
         .bind(data.strategy_type)
         .execute(&self.pool)
         .await?;
@@ -310,10 +313,11 @@ impl PostgresPersistence {
     }
 
     /// Load all active tracked tokens (SYSTEM-LEVEL)
-    pub async fn load_tracked_tokens(&self) -> Result<Vec<(String, String, String)>> {
+    /// Returns: (symbol, address, name, decimals)
+    pub async fn load_tracked_tokens(&self) -> Result<Vec<(String, String, String, u8)>> {
         let rows = sqlx::query(
             r#"
-            SELECT symbol, address, name
+            SELECT symbol, address, name, decimals
             FROM tracked_tokens
             WHERE status = 'active'
             ORDER BY created_at ASC
@@ -328,7 +332,8 @@ impl PostgresPersistence {
             let symbol: String = row.get("symbol");
             let address: String = row.get("address");
             let name: String = row.get("name");
-            tokens.push((symbol, address, name));
+            let decimals: i16 = row.get("decimals");
+            tokens.push((symbol, address, name, decimals as u8));
         }
 
         tracing::info!("Loaded {} tracked tokens from Postgres", tokens.len());

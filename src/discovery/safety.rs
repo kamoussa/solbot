@@ -162,7 +162,6 @@ mod tests {
             volume_24h_usd: 100_000_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 500_000_000.0,
-            marketcap: 500_000_000.0,
             rank: 5,
             price: 100.0,
             price_24h_change_percent: 2.0,
@@ -184,7 +183,6 @@ mod tests {
             volume_24h_usd: 10_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 1_000_000.0,
-            marketcap: 1_000_000.0,
             rank: 500,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -206,7 +204,6 @@ mod tests {
             volume_24h_usd: 100_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 5_000_000.0, // Liquidity > FDV (suspicious!)
-            marketcap: 5_000_000.0,
             rank: 100,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -228,7 +225,6 @@ mod tests {
             volume_24h_usd: 5_000.0, // Below $10k threshold
             volume_24h_change_percent: 5.0,
             fdv: 10_000_000.0,
-            marketcap: 10_000_000.0,
             rank: 200,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -250,7 +246,6 @@ mod tests {
             volume_24h_usd: 50_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 100_000_000.0, // Only 0.1% liquidity ratio
-            marketcap: 100_000_000.0,
             rank: 300,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -272,7 +267,6 @@ mod tests {
             volume_24h_usd: 10_000_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 500_000_000.0, // 1% liquidity ratio (healthy)
-            marketcap: 500_000_000.0,
             rank: 10,
             price: 0.5,
             price_24h_change_percent: 2.0,
@@ -294,7 +288,6 @@ mod tests {
             volume_24h_usd: 0.0,         // But zero volume!
             volume_24h_change_percent: 0.0,
             fdv: 500_000_000.0,
-            marketcap: 500_000_000.0,
             rank: 5,
             price: 100.0,
             price_24h_change_percent: 0.0,
@@ -316,7 +309,6 @@ mod tests {
             volume_24h_usd: 100_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 1_000_000.0,
-            marketcap: 1_000_000.0,
             rank: 100,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -338,7 +330,6 @@ mod tests {
             volume_24h_usd: f64::NAN, // NaN!
             volume_24h_change_percent: 5.0,
             fdv: 10_000_000.0,
-            marketcap: 10_000_000.0,
             rank: 100,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -360,7 +351,6 @@ mod tests {
             volume_24h_usd: 100_000.0,
             volume_24h_change_percent: 5.0,
             fdv: f64::INFINITY, // Infinite!
-            marketcap: 10_000_000.0,
             rank: 100,
             price: 1.0,
             price_24h_change_percent: 2.0,
@@ -382,7 +372,6 @@ mod tests {
             volume_24h_usd: 100_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 10_000_000.0,
-            marketcap: 10_000_000.0,
             rank: 100,
             price: 0.0, // Zero price!
             price_24h_change_percent: 2.0,
@@ -404,7 +393,6 @@ mod tests {
             volume_24h_usd: 10_000_000.0,
             volume_24h_change_percent: 50.0,
             fdv: 50_000_000.0,
-            marketcap: 50_000_000.0,
             rank: 10,
             price: 1.0,
             price_24h_change_percent: 624.0, // 624% in 24h = pump
@@ -426,7 +414,6 @@ mod tests {
             volume_24h_usd: 5_000_000.0,
             volume_24h_change_percent: -47.5, // Volume dropping
             fdv: 20_000_000.0,
-            marketcap: 20_000_000.0,
             rank: 50,
             price: 1.0,
             price_24h_change_percent: 150.0, // But price still up
@@ -448,7 +435,6 @@ mod tests {
             volume_24h_usd: 10_000_000.0,
             volume_24h_change_percent: 50.0,
             fdv: 50_000_000.0,
-            marketcap: 50_000_000.0,
             rank: 10,
             price: 1.0,
             price_24h_change_percent: 25.0, // Moderate 25% growth is fine
@@ -470,7 +456,6 @@ mod tests {
             volume_24h_usd: 10_000_000.0,
             volume_24h_change_percent: 5.0,
             fdv: 100_000_000.0,
-            marketcap: 100_000_000.0,
             rank: 0, // Invalid rank!
             price: 1.0,
             price_24h_change_percent: 2.0,

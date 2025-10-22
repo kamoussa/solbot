@@ -3,8 +3,11 @@ use crate::Result;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use tokio::time::{sleep, Duration};
 
 const DEXSCREENER_API_BASE: &str = "https://api.dexscreener.com/latest/dex";
+const MAX_RETRIES: u32 = 3;
+const INITIAL_BACKOFF_MS: u64 = 2000; // Start with 2 seconds
 
 /// Client for DexScreener API
 #[derive(Clone)]
@@ -55,12 +58,50 @@ impl DexScreenerClient {
     }
 
     /// Get current price for a token by its mint address
+    /// Includes retry logic with exponential backoff for transient failures
     pub async fn get_price(&self, token_address: &str) -> Result<PriceData> {
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self.fetch_price_once(token_address).await {
+                Ok(price_data) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            "✓ Successfully fetched {} after {} attempts",
+                            token_address,
+                            attempt
+                        );
+                    }
+                    return Ok(price_data);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+
+                    if attempt < MAX_RETRIES {
+                        let backoff_ms = INITIAL_BACKOFF_MS * 2_u64.pow(attempt - 1);
+                        tracing::warn!(
+                            "Attempt {}/{} failed for {}: {}. Retrying in {}ms...",
+                            attempt,
+                            MAX_RETRIES,
+                            token_address,
+                            last_error.as_ref().unwrap(),
+                            backoff_ms
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        Err(last_error.unwrap_or_else(|| "All retry attempts failed".into()))
+    }
+
+    /// Internal method to fetch price once (without retry logic)
+    async fn fetch_price_once(&self, token_address: &str) -> Result<PriceData> {
         let url = format!("{}/tokens/{}", DEXSCREENER_API_BASE, token_address);
 
         let response_raw = self.client.get(&url).send().await?;
-        //tracing::info!("Response: {:?}", response_raw.status());
-        //tracing::info!("Response: {:?}", response_raw.headers());
         let response: DexScreenerResponse = response_raw.json().await?;
 
         // Get the Solana pair (if multiple pairs exist, prefer Solana)

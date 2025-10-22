@@ -50,6 +50,7 @@ struct TrendingTokenRaw {
     #[serde(rename = "volume24hChangePercent")]
     volume_24h_change_percent: Option<f64>,
     fdv: Option<f64>,
+    #[allow(dead_code)]  // Returned by API but not used in our struct
     marketcap: Option<f64>,
     rank: Option<u32>,
     price: f64,
@@ -69,7 +70,6 @@ pub struct TrendingToken {
     pub volume_24h_usd: f64,
     pub volume_24h_change_percent: f64,
     pub fdv: f64,
-    pub marketcap: f64,
     pub rank: u32,
     pub price: f64,
     pub price_24h_change_percent: f64,
@@ -86,7 +86,6 @@ impl From<TrendingTokenRaw> for TrendingToken {
             volume_24h_usd: raw.volume_24h_usd,
             volume_24h_change_percent: raw.volume_24h_change_percent.unwrap_or(0.0),
             fdv: raw.fdv.unwrap_or(0.0),
-            marketcap: raw.marketcap.unwrap_or(0.0),
             rank: raw.rank.unwrap_or(9999),
             price: raw.price,
             price_24h_change_percent: raw.price_24h_change_percent.unwrap_or(0.0),
@@ -266,13 +265,14 @@ mod tests {
         println!("Got {} trending tokens", tokens.len());
         for (i, token) in tokens.iter().enumerate() {
             println!(
-                "{}. {} ({}) - Price: ${:.6}, Vol: ${:.0}, Liq: ${:.0}, Change: {:.2}%",
+                "{}. {} ({}) - Price: ${:.6}, Vol: ${:.0}, Liq: ${:.0}, FDV: ${:.0}, Change: {:.2}%",
                 i + 1,
                 token.symbol,
                 token.name,
                 token.price,
                 token.volume_24h_usd,
                 token.liquidity_usd,
+                token.fdv,
                 token.price_24h_change_percent
             );
         }
@@ -325,7 +325,7 @@ mod tests {
                 "   Liquidity: ${:.0}, Volume 24h: ${:.0}",
                 token.liquidity_usd, token.volume_24h_usd
             );
-            println!("   FDV: ${:.0}, MCap: ${:.0}", token.fdv, token.marketcap);
+            println!("   FDV: ${:.0}", token.fdv);
 
             if token.fdv > 0.0 {
                 let liq_ratio = (token.liquidity_usd / token.fdv) * 100.0;
