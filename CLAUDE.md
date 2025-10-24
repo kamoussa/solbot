@@ -8,6 +8,8 @@ CryptoBot is a Solana-based cryptocurrency trading bot using swing trading strat
 
 ## Commands
 
+Note: you keep trying to use the timeout command but it doesn't exist. Stop trying to use it.
+
 ### Build and Test
 ```bash
 # Build the project
@@ -115,6 +117,7 @@ This repository follows a structured four-phase development process for all feat
 - Write tests before implementation code
 - Ensure comprehensive test coverage
 - Run tests frequently during development
+- Keep the code simple and remove dead code to not mislead the reader
 
 ### 4. Critique Phase (Implementation Review)
 - Review the implementation for correctness

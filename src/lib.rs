@@ -1,5 +1,6 @@
 // Core modules
 pub mod api;
+pub mod backfill;
 pub mod backtest;
 pub mod db;
 pub mod discovery;

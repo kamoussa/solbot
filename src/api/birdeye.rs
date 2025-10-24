@@ -50,7 +50,7 @@ struct TrendingTokenRaw {
     #[serde(rename = "volume24hChangePercent")]
     volume_24h_change_percent: Option<f64>,
     fdv: Option<f64>,
-    #[allow(dead_code)]  // Returned by API but not used in our struct
+    #[allow(dead_code)] // Returned by API but not used in our struct
     marketcap: Option<f64>,
     rank: Option<u32>,
     price: f64,

@@ -46,6 +46,12 @@ yata = "0.7"
 # Random number generation (for backtesting)
 rand = "0.8"
 
+# Rate limiting
+governor = "0.6"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
 [dev-dependencies]
 # Testing
 mockito = "1.6"

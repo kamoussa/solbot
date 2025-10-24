@@ -1,4 +1,8 @@
+use chrono::{Timelike, Utc};
+use clap::{Parser, Subcommand};
 use cryptobot::api::birdeye::{BirdeyeClient, TrendingToken};
+use cryptobot::api::CoinGeckoClient;
+use cryptobot::backfill::backfill_token;
 use cryptobot::db::PostgresPersistence;
 use cryptobot::discovery::safety::is_safe_token;
 use cryptobot::execution::{
@@ -11,7 +15,6 @@ use cryptobot::strategy::momentum::MomentumStrategy;
 use cryptobot::strategy::signals::validate_candle_uniformity;
 use cryptobot::strategy::Strategy;
 use cryptobot::Result;
-use chrono::{Timelike, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::time::{interval_at, Duration, Instant};
@@ -24,6 +27,39 @@ const MUST_TRACK: &[(&str, &str)] = &[
 
 const MAX_TOKENS: usize = 10;
 const POLL_INTERVAL_MINUTES: u64 = 5;
+
+// ============================================================================
+// CLI
+// ============================================================================
+
+/// CryptoBot - Cryptocurrency trading bot
+#[derive(Parser, Debug)]
+#[command(name = "cryptobot")]
+#[command(about = "Cryptocurrency trading bot for Solana tokens", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Backfill historical data for a token
+    Backfill {
+        /// Token symbol (e.g., SOL, JUP)
+        symbol: String,
+
+        /// Token mint address
+        address: String,
+
+        /// Number of days to backfill (default: 7)
+        #[arg(short, long, default_value = "7")]
+        days: u32,
+
+        /// Force overwrite existing data
+        #[arg(short, long)]
+        force: bool,
+    },
+}
 
 // ============================================================================
 // Shared State
@@ -65,6 +101,20 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     setup_logging();
 
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Backfill {
+            symbol,
+            address,
+            days,
+            force,
+        }) => run_backfill(&symbol, &address, days, force).await,
+        None => run_bot().await,
+    }
+}
+
+async fn run_bot() -> Result<()> {
     tracing::info!("🚀 CryptoBot starting - Multi-Loop Architecture");
 
     // Get environment variables
@@ -93,7 +143,13 @@ async fn main() -> Result<()> {
         return Err("No safe tokens found! Cannot start bot.".into());
     }
 
-    tracing::info!("✅ Initial discovery complete: {} tokens", initial_tokens.len());
+    tracing::info!(
+        "✅ Initial discovery complete: {} tokens",
+        initial_tokens.len()
+    );
+
+    // Initialize and run backfill for tokens with insufficient data
+    initialize_and_run_backfill(&final_tokens, &redis_url).await;
 
     // Initialize position manager
     let circuit_breakers = CircuitBreakers::default();
@@ -212,6 +268,52 @@ async fn connect_to_postgres() -> Option<PostgresPersistence> {
     }
 }
 
+async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Result<()> {
+    tracing::info!(
+        "📥 Backfill Mode: {} ({}) for {} days",
+        symbol,
+        address,
+        days
+    );
+    if force {
+        tracing::info!("  Force mode: will overwrite existing data");
+    }
+
+    // Get required environment variables
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let coingecko_api_key =
+        std::env::var("COINGECKO_API_KEY").expect("COINGECKO_API_KEY not found in environment");
+
+    // Initialize CoinGecko client
+    tracing::info!("🔄 Initializing CoinGecko client...");
+    let coingecko = CoinGeckoClient::new(coingecko_api_key).await?;
+
+    // Initialize Redis persistence
+    tracing::info!("🔄 Connecting to Redis at {}...", redis_url);
+    let mut redis = RedisPersistence::new(&redis_url).await?;
+
+    // Run backfill
+    let stats = backfill_token(symbol, address, days, force, &coingecko, &mut redis).await?;
+
+    // Print results
+    tracing::info!("\n📊 Backfill Results:");
+    tracing::info!("  Fetched data points: {}", stats.fetched_points);
+    tracing::info!("  Converted candles: {}", stats.converted_candles);
+    tracing::info!("  Skipped existing: {}", stats.skipped_existing);
+    tracing::info!("  Stored new: {}", stats.stored_new);
+    tracing::info!("  Validation failures: {}", stats.validation_failures);
+
+    if stats.stored_new > 0 {
+        tracing::info!("\n✅ Backfill complete!");
+    } else if stats.skipped_existing > 0 {
+        tracing::info!("\n✅ All data already present, nothing to backfill");
+    } else {
+        tracing::warn!("\n⚠️  No data was stored");
+    }
+
+    Ok(())
+}
 
 fn create_birdeye_client() -> Result<BirdeyeClient> {
     let api_key =
@@ -262,8 +364,6 @@ async fn load_positions_from_db(
         }
     }
 }
-
-
 
 // ============================================================================
 // Token Discovery Functions
@@ -360,12 +460,7 @@ async fn build_final_token_list(
     .await;
 
     // Add must-track tokens
-    add_must_track_tokens(
-        &safe_tokens,
-        &mut final_tokens,
-        &mut tracked_addresses,
-    )
-    .await;
+    add_must_track_tokens(&safe_tokens, &mut final_tokens, &mut tracked_addresses).await;
 
     // Add new safe tokens (up to MAX_TOKENS total)
     add_new_safe_tokens(&safe_tokens, &mut final_tokens, &mut tracked_addresses);
@@ -445,7 +540,10 @@ async fn add_must_track_tokens(
             // Token found in trending - use fresh data
             final_tokens.push((*token).clone());
             tracked_addresses.insert(address.to_string());
-            tracing::info!("✓ Must-track {} found in trending, using fresh data", symbol);
+            tracing::info!(
+                "✓ Must-track {} found in trending, using fresh data",
+                symbol
+            );
         } else {
             // Must-track token not in trending - add with hardcoded metadata
             // This is unusual for blue chips like SOL/JUP but can happen
@@ -458,7 +556,12 @@ async fn add_must_track_tokens(
             let token = TrendingToken {
                 address: address.to_string(),
                 symbol: symbol.to_string(),
-                name: if *symbol == "SOL" { "Solana" } else { "Jupiter" }.to_string(),
+                name: if *symbol == "SOL" {
+                    "Solana"
+                } else {
+                    "Jupiter"
+                }
+                .to_string(),
                 decimals: 9, // SOL and JUP both use 9 decimals
                 liquidity_usd: 0.0,
                 volume_24h_usd: 0.0,
@@ -470,7 +573,10 @@ async fn add_must_track_tokens(
             };
             final_tokens.push(token);
             tracked_addresses.insert(address.to_string());
-            tracing::info!("✓ Added must-track {} (pre-approved, skips safety checks)", symbol);
+            tracing::info!(
+                "✓ Added must-track {} (pre-approved, skips safety checks)",
+                symbol
+            );
         }
     }
 }
@@ -585,11 +691,7 @@ async fn price_fetch_loop(tokens: Arc<RwLock<Vec<Token>>>, redis_url: String) {
 
             match result {
                 Ok(snapshot) => {
-                    tracing::info!(
-                        "  ✓ {} @ ${:.4}",
-                        token.symbol,
-                        snapshot.price
-                    );
+                    tracing::info!("  ✓ {} @ ${:.4}", token.symbol, snapshot.price);
 
                     // Save to Redis
                     if let Ok(candles) = price_manager.buffer().get_candles(&token.symbol) {
@@ -598,7 +700,11 @@ async fn price_fetch_loop(tokens: Arc<RwLock<Vec<Token>>>, redis_url: String) {
                                 .save_candles(&token.symbol, std::slice::from_ref(latest_candle))
                                 .await
                             {
-                                tracing::warn!("  ✗ Failed to save {} to Redis: {}", token.symbol, e);
+                                tracing::warn!(
+                                    "  ✗ Failed to save {} to Redis: {}",
+                                    token.symbol,
+                                    e
+                                );
                             }
                         }
                     }
@@ -617,7 +723,11 @@ async fn price_fetch_loop(tokens: Arc<RwLock<Vec<Token>>>, redis_url: String) {
                 match redis.cleanup_old(&token.symbol, KEEP_HOURS).await {
                     Ok(removed) => {
                         if removed > 0 {
-                            tracing::info!("  ✓ Cleaned up {} old snapshots for {}", removed, token.symbol);
+                            tracing::info!(
+                                "  ✓ Cleaned up {} old snapshots for {}",
+                                removed,
+                                token.symbol
+                            );
                         }
                     }
                     Err(e) => {
@@ -663,10 +773,7 @@ async fn trading_execution_loop(
     // This gives price_fetch_loop time to complete
     let start = next_5min_boundary_plus_30s();
     let delay = start - Instant::now();
-    tracing::info!(
-        "Trading will start in {:?} (30s after price fetch)",
-        delay
-    );
+    tracing::info!("Trading will start in {:?} (30s after price fetch)", delay);
 
     let mut ticker = interval_at(start, Duration::from_secs(300));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -739,7 +846,11 @@ async fn trading_execution_loop(
         save_positions_to_db(postgres.as_mut(), &closed_positions).await;
 
         // Log portfolio summary
-        log_portfolio_summary(&state.position_manager, &prices, state.initial_portfolio_value);
+        log_portfolio_summary(
+            &state.position_manager,
+            &prices,
+            state.initial_portfolio_value,
+        );
     }
 }
 
@@ -753,6 +864,28 @@ async fn token_discovery_loop(
     tracing::info!("🔍 Token Discovery Loop starting...");
 
     let birdeye_client = BirdeyeClient::new(birdeye_api_key);
+
+    // Initialize CoinGecko client if API key is available (for backfilling)
+    let coingecko_client = match std::env::var("COINGECKO_API_KEY") {
+        Ok(api_key) => match CoinGeckoClient::new(api_key).await {
+            Ok(client) => {
+                tracing::info!("✓ CoinGecko backfill enabled");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize CoinGecko client: {}", e);
+                None
+            }
+        },
+        Err(_) => {
+            tracing::info!("CoinGecko backfill disabled (COINGECKO_API_KEY not set)");
+            None
+        }
+    };
+
+    // Get Redis URL for backfilling
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     // Start immediately, then run every 30 minutes
     let mut ticker = interval_at(Instant::now(), Duration::from_secs(1800));
@@ -774,6 +907,26 @@ async fn token_discovery_loop(
             Ok(final_tokens) => {
                 tracing::info!("  ✓ Discovered {} tokens", final_tokens.len());
 
+                // Check which tokens need backfilling (new OR insufficient data)
+                let tokens_to_backfill = if coingecko_client.is_some() {
+                    identify_tokens_needing_backfill(&final_tokens, &redis_url).await
+                } else {
+                    Vec::new()
+                };
+
+                if !tokens_to_backfill.is_empty() {
+                    tracing::info!(
+                        "  📥 {} tokens need backfill (new or insufficient data)",
+                        tokens_to_backfill.len()
+                    );
+
+                    // Trigger backfill (non-blocking)
+                    if let Some(ref cg_client) = coingecko_client {
+                        spawn_backfill_tasks(tokens_to_backfill, cg_client.clone(), &redis_url)
+                            .await;
+                    }
+                }
+
                 // Save to database
                 if let Some(mut pg) = postgres {
                     save_tracked_tokens_to_db(&mut pg, &final_tokens).await;
@@ -789,6 +942,199 @@ async fn token_discovery_loop(
                 tracing::error!("  ✗ Discovery failed: {}", e);
             }
         }
+    }
+}
+
+/// Initialize CoinGecko client and run backfill for tokens with insufficient data
+async fn initialize_and_run_backfill(tokens: &[TrendingToken], redis_url: &str) {
+    // Try to initialize CoinGecko client
+    let coingecko_client = match std::env::var("COINGECKO_API_KEY") {
+        Ok(api_key) => match CoinGeckoClient::new(api_key).await {
+            Ok(client) => {
+                tracing::info!("✓ CoinGecko backfill enabled");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize CoinGecko client: {}", e);
+                None
+            }
+        },
+        Err(_) => {
+            tracing::info!("COINGECKO_API_KEY not set, backfill disabled");
+            None
+        }
+    };
+
+    // Early return if no CoinGecko client
+    let Some(cg_client) = coingecko_client else {
+        return;
+    };
+
+    // Identify tokens needing backfill
+    let tokens_to_backfill = identify_tokens_needing_backfill(tokens, redis_url).await;
+
+    if tokens_to_backfill.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        "  📥 {} tokens need backfill (new or insufficient data)",
+        tokens_to_backfill.len()
+    );
+
+    // Spawn backfill tasks (non-blocking)
+    spawn_backfill_tasks(tokens_to_backfill, cg_client, redis_url).await;
+}
+
+/// Identify tokens that need backfilling (new tokens OR existing tokens with insufficient data)
+///
+/// Checks Redis for candle count and returns tokens with < 200 candles (roughly 1 day of 5-min data)
+async fn identify_tokens_needing_backfill(
+    tokens: &[TrendingToken],
+    redis_url: &str,
+) -> Vec<(String, String)> {
+    const MIN_CANDLES_THRESHOLD: u64 = 200; // ~1 day of 5-min candles
+
+    let mut tokens_needing_backfill = Vec::new();
+
+    // Connect to Redis to check candle counts
+    let mut redis = match RedisPersistence::new(redis_url).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to connect to Redis for backfill check: {}", e);
+            return tokens_needing_backfill;
+        }
+    };
+
+    for token in tokens {
+        // Load existing candles for this token
+        match redis
+            .load_candles(&token.symbol, MIN_CANDLES_THRESHOLD)
+            .await
+        {
+            Ok(candles) => {
+                let candle_count = candles.len() as u64;
+
+                if candle_count < MIN_CANDLES_THRESHOLD {
+                    tracing::debug!(
+                        "Token {} has {} candles (< {} threshold), needs backfill",
+                        token.symbol,
+                        candle_count,
+                        MIN_CANDLES_THRESHOLD
+                    );
+                    tokens_needing_backfill.push((token.symbol.clone(), token.address.clone()));
+                } else {
+                    tracing::debug!(
+                        "Token {} has {} candles, sufficient data",
+                        token.symbol,
+                        candle_count
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "Failed to load candles for {} (will backfill): {}",
+                    token.symbol,
+                    e
+                );
+                // If we can't load, assume it needs backfill
+                tokens_needing_backfill.push((token.symbol.clone(), token.address.clone()));
+            }
+        }
+    }
+
+    tokens_needing_backfill
+}
+
+/// Spawn background tasks to backfill newly discovered tokens
+///
+/// Uses a shared CoinGecko client (with shared rate limiter) and limits
+/// concurrent backfills to avoid overwhelming the API or Redis.
+async fn spawn_backfill_tasks(
+    new_tokens: Vec<(String, String)>,
+    coingecko_client: CoinGeckoClient,
+    redis_url: &str,
+) {
+    const BACKFILL_DAYS: u32 = 1; // 1 day = ~287 candles at 5-min resolution
+    const MAX_CONCURRENT: usize = 3; // Limit concurrent backfills
+
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
+
+    for (symbol, address) in new_tokens {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let cg_client = coingecko_client.clone(); // Shares rate limiter!
+        let redis_url_clone = redis_url.to_string();
+
+        // Spawn a background task for backfilling
+        tokio::spawn(async move {
+            let _permit = permit; // Hold permit until task completes
+            tracing::info!("  📥 Starting backfill for {} ({}d)", symbol, BACKFILL_DAYS);
+
+            // Connect to Redis
+            let mut redis = match RedisPersistence::new(&redis_url_clone).await {
+                Ok(redis) => redis,
+                Err(e) => {
+                    tracing::error!("  ✗ Failed to connect to Redis for {}: {}", symbol, e);
+                    return;
+                }
+            };
+
+            // Run backfill with retry logic
+            const MAX_RETRIES: u32 = 3;
+            let mut last_error = None;
+
+            for attempt in 1..=MAX_RETRIES {
+                match backfill_token(
+                    &symbol,
+                    &address,
+                    BACKFILL_DAYS,
+                    false, // Don't force overwrite
+                    &cg_client,
+                    &mut redis,
+                )
+                .await
+                {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "  ✓ Backfill complete for {}: stored {} candles (skipped {}, failed validation {})",
+                            symbol,
+                            stats.stored_new,
+                            stats.skipped_existing,
+                            stats.validation_failures
+                        );
+                        return; // Success!
+                    }
+                    Err(e) => {
+                        last_error = Some(e);
+                        if attempt < MAX_RETRIES {
+                            let backoff_secs = 2u64.pow(attempt);
+                            tracing::warn!(
+                                "  ⚠️  Backfill attempt {}/{} failed for {}, retrying in {}s...",
+                                attempt,
+                                MAX_RETRIES,
+                                symbol,
+                                backoff_secs
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs))
+                                .await;
+                        }
+                    }
+                }
+            }
+
+            // All retries failed
+            if let Some(e) = last_error {
+                tracing::error!(
+                    "  ✗ Backfill failed for {} after {} attempts: {}",
+                    symbol,
+                    MAX_RETRIES,
+                    e
+                );
+            }
+        });
     }
 }
 
