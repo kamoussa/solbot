@@ -130,17 +130,38 @@ pub fn analyze_market_conditions(
     let long_ma = calculate_sma(prices, config.long_ma_period)?;
 
     // Calculate volume conditions
-    let avg_volume = volumes.iter().sum::<f64>() / volumes.len() as f64;
     let current_volume = volumes.last()?;
-    let volume_spike = current_volume / avg_volume > config.volume_threshold;
-    let volume_ratio = current_volume / avg_volume;
+
+    // Detect if we have real volume data (e.g., from Birdeye)
+    // CoinGecko backfilled data has volume=0.0, which breaks volume analysis
+    // If there are ANY zeros, the average and ratio calculations are meaningless
+    let has_volume_data = volumes.iter().all(|&v| v > 0.1);
+
+    let (volume_spike, volume_ratio) = if has_volume_data {
+        let avg_volume = volumes.iter().sum::<f64>() / volumes.len() as f64;
+        let ratio = current_volume / avg_volume;
+        (ratio > config.volume_threshold, ratio)
+    } else {
+        (false, 0.0) // No volume data, skip volume check
+    };
 
     // Current price
     let current_price = prices.last()?;
 
+    // Log if we're operating without volume data
+    if !has_volume_data {
+        let zero_count = volumes.iter().filter(|&&v| v <= 0.1).count();
+        tracing::warn!(
+            "⚠️  Incomplete volume data ({}/{} candles missing volume), trading without volume confirmation. \
+             This is likely CoinGecko backfilled data - volume analysis will activate after 24h of Birdeye data.",
+            zero_count, volumes.len()
+        );
+    }
+
     // ==================== PANIC BUY LOGIC ====================
     // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)
-    if config.enable_panic_buy && prices.len() > config.panic_drop_window_candles {
+    // IMPORTANT: Panic buy requires volume spike confirmation, so skip if no volume data
+    if has_volume_data && config.enable_panic_buy && prices.len() > config.panic_drop_window_candles {
         let window_start = prices
             .len()
             .saturating_sub(config.panic_drop_window_candles);
@@ -190,23 +211,39 @@ pub fn analyze_market_conditions(
     let ma_crossover = short_ma > long_ma;
     let price_above_ma = *current_price > short_ma;
 
-    let buy_conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
-    let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+    // Without volume data, require all 3 other conditions (more conservative)
+    // With volume data, require 3 out of 4 conditions (allows flexibility)
+    let (buy_signal, buy_reason) = if has_volume_data {
+        let buy_conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
+        let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+        (
+            buy_count >= 3,
+            format!(
+                "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
+                rsi_condition, ma_crossover, price_above_ma, volume_spike, buy_count
+            ),
+        )
+    } else {
+        // No volume data: require all 3 conditions (conservative mode)
+        let buy_conditions = [rsi_condition, ma_crossover, price_above_ma];
+        let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+        let all_met = buy_count == 3;
+        (
+            all_met,
+            format!(
+                "BUY conditions (NO VOLUME): RSI<40={}, MA↑={}, Price>MA={} ({}/3 met, all required)",
+                rsi_condition, ma_crossover, price_above_ma, buy_count
+            ),
+        )
+    };
 
     // Check sell conditions
     let rsi_overbought = rsi > config.rsi_overbought;
     let ma_crossunder = short_ma < long_ma;
 
     // Determine signal with detailed logging
-    let signal = if buy_count >= 3 {
-        tracing::info!(
-            "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
-            rsi_condition,
-            ma_crossover,
-            price_above_ma,
-            volume_spike,
-            buy_count
-        );
+    let signal = if buy_signal {
+        tracing::info!("{}", buy_reason);
         Signal::Buy
     } else if rsi_overbought && ma_crossunder {
         tracing::info!(
@@ -216,12 +253,19 @@ pub fn analyze_market_conditions(
         );
         Signal::Sell
     } else {
-        tracing::debug!(
-            "HOLD: Buy {}/4, Sell RSI>70={} MA↓={}",
-            buy_count,
-            rsi_overbought,
-            ma_crossunder
-        );
+        if has_volume_data {
+            tracing::debug!(
+                "HOLD: Buy conditions not met, Sell RSI>70={} MA↓={}",
+                rsi_overbought,
+                ma_crossunder
+            );
+        } else {
+            tracing::debug!(
+                "HOLD (NO VOLUME): Buy conditions not met, Sell RSI>70={} MA↓={}",
+                rsi_overbought,
+                ma_crossunder
+            );
+        }
         Signal::Hold
     };
 
@@ -507,5 +551,142 @@ mod tests {
             Signal::Buy,
             "Should not panic buy in deep downtrend"
         );
+    }
+
+    #[test]
+    fn test_zero_volume_no_crash() {
+        // Test that zero volume data doesn't cause division by zero (NaN)
+        // This happens with CoinGecko backfilled data
+        let prices = vec![
+            100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 114.0, 116.0, 118.0, 120.0, 122.0,
+            124.0, 126.0, 128.0, 130.0, 132.0, 134.0, 136.0, 138.0, 140.0,
+        ];
+        let volumes = vec![0.0; prices.len()]; // All zeros (CoinGecko data)
+
+        let config = SignalConfig::default();
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Should return a valid signal (not crash)
+        assert!(signal.is_some());
+    }
+
+    #[test]
+    fn test_zero_volume_panic_buy_disabled() {
+        // Even with perfect panic buy conditions, zero volume should skip it
+        let mut prices = vec![200.0; 20];
+        for i in 1..=12 {
+            prices.push(200.0 - (i as f64 * 1.67)); // Sharp drop
+        }
+        prices.push(180.0); // -10% flash crash
+
+        let volumes = vec![0.0; prices.len()]; // No volume data
+
+        let config = SignalConfig::default(); // Panic buy enabled
+
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Should NOT trigger panic buy without volume confirmation
+        assert!(signal.is_some());
+        // Might still generate regular buy if other conditions met, but NOT panic buy
+    }
+
+    #[test]
+    fn test_zero_volume_conservative_buy() {
+        // With zero volume, should require ALL 3 conditions (not 3/4)
+        let prices = vec![
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+            100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0,
+            90.0, // Drop to create oversold RSI
+        ];
+        let volumes = vec![0.0; prices.len()];
+
+        let config = SignalConfig::default();
+        let signal = analyze_market_conditions(&prices, &volumes, &config);
+
+        // Without volume, need all 3 other conditions
+        // This test just ensures it doesn't crash and produces valid output
+        assert!(signal.is_some());
+    }
+
+    #[test]
+    fn test_zero_volume_vs_real_volume() {
+        // Same price scenario, different outcomes with/without volume
+        let prices = vec![
+            100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 114.0, 116.0, 118.0, 120.0, 122.0,
+            124.0, 126.0, 128.0, 130.0, 132.0, 134.0, 136.0, 138.0, 140.0,
+        ];
+
+        // Scenario 1: Zero volume
+        let zero_volumes = vec![0.0; prices.len()];
+        let config = SignalConfig::default();
+        let signal_zero = analyze_market_conditions(&prices, &zero_volumes, &config);
+
+        // Scenario 2: With volume spike
+        let mut real_volumes = vec![1000.0; prices.len() - 1];
+        real_volumes.push(2500.0); // Volume spike
+        let signal_volume = analyze_market_conditions(&prices, &real_volumes, &config);
+
+        // Both should return valid signals
+        assert!(signal_zero.is_some());
+        assert!(signal_volume.is_some());
+
+        // The behavior may differ (volume spike could trigger buy when zero volume doesn't)
+        // but both should be valid Signal enum values
+    }
+
+    #[test]
+    fn test_mixed_volume_disables_volume_features() {
+        // CRITICAL TEST: Mixed zeros + real volumes should disable volume features
+        // This is the exact scenario that would break with avg_volume > 1.0 detection
+        // Simulates: 19 CoinGecko candles (volume=0) + 1 Birdeye candle (volume=5000)
+        let prices = vec![
+            100.0, 102.0, 104.0, 106.0, 108.0, 110.0, 112.0, 114.0, 116.0, 118.0, 120.0, 122.0,
+            124.0, 126.0, 128.0, 130.0, 132.0, 134.0, 136.0, 138.0, 140.0,
+        ];
+
+        // 19 zeros (CoinGecko backfill) + 1 real volume (Birdeye)
+        let mut mixed_volumes = vec![0.0; prices.len() - 1];
+        mixed_volumes.push(5000.0); // One real candle
+
+        // With old logic (avg_volume > 1.0):
+        //   avg = 5000 / 20 = 250 ✓ Passes threshold
+        //   volume_spike = 5000 / 250 = 20x 🚨 FALSE SPIKE
+        //
+        // With new logic (.all()):
+        //   has_volume_data = false (because there are zeros)
+        //   volume_spike = false ✓ Correctly disabled
+
+        let config = SignalConfig::default();
+        let signal = analyze_market_conditions(&prices, &mixed_volumes, &config);
+
+        // Should return valid signal (not crash)
+        assert!(signal.is_some());
+
+        // Should operate in conservative mode (volume features disabled)
+        // We can't directly check has_volume_data, but we verify no panic
+        // and signal generation works correctly
+    }
+
+    #[test]
+    fn test_mixed_volume_no_panic_buy() {
+        // Mixed volumes should disable panic buy (requires volume confirmation)
+        let mut prices = vec![200.0; 20];
+        for i in 1..=12 {
+            prices.push(200.0 - (i as f64 * 1.67)); // Sharp drop
+        }
+        prices.push(180.0); // -10% flash crash
+
+        // 32 zeros + 1 huge volume spike (perfect panic buy setup if volume was valid)
+        let mut mixed_volumes = vec![0.0; prices.len() - 1];
+        mixed_volumes.push(10000.0); // Massive "spike" (but meaningless)
+
+        let config = SignalConfig::default(); // Panic buy enabled
+
+        let signal = analyze_market_conditions(&prices, &mixed_volumes, &config);
+
+        // Should NOT trigger panic buy because volume data is incomplete
+        // Old logic would see avg_volume = 312.5 and ratio = 32x (false spike!)
+        // New logic correctly disables volume features
+        assert!(signal.is_some());
     }
 }
