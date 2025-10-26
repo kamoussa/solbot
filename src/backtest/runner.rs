@@ -119,14 +119,14 @@ impl BacktestRunner {
                                         }
                                     }
                                 }
-                                ExecutionAction::Close { position_id } => {
+                                ExecutionAction::Close {
+                                    position_id,
+                                    exit_reason,
+                                } => {
                                     // Close position
                                     let mut pm = position_manager.lock().unwrap();
-                                    let _ = pm.close_position(
-                                        position_id,
-                                        current_price,
-                                        crate::execution::ExitReason::Manual,
-                                    );
+                                    let _ =
+                                        pm.close_position(position_id, current_price, exit_reason);
                                 }
                                 ExecutionAction::Skip => {
                                     // Do nothing
