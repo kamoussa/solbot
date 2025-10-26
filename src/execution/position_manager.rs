@@ -16,6 +16,7 @@ pub enum ExitReason {
     TakeProfit,
     TimeStop,
     Manual,
+    StrategySell, // Strategy-driven sell signal (e.g., overbought conditions)
 }
 
 #[derive(Debug, Clone)]

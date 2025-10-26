@@ -57,6 +57,7 @@ impl PostgresPersistence {
             ExitReason::TakeProfit => "TakeProfit",
             ExitReason::TimeStop => "TimeStop",
             ExitReason::Manual => "Manual",
+            ExitReason::StrategySell => "StrategySell",
         });
 
         sqlx::query(
@@ -148,6 +149,7 @@ impl PostgresPersistence {
                 Some("TakeProfit") => Some(ExitReason::TakeProfit),
                 Some("TimeStop") => Some(ExitReason::TimeStop),
                 Some("Manual") => Some(ExitReason::Manual),
+                Some("StrategySell") => Some(ExitReason::StrategySell),
                 None => None,
                 _ => return Err("Invalid exit reason".into()),
             };
@@ -221,6 +223,7 @@ impl PostgresPersistence {
                 Some("TakeProfit") => Some(ExitReason::TakeProfit),
                 Some("TimeStop") => Some(ExitReason::TimeStop),
                 Some("Manual") => Some(ExitReason::Manual),
+                Some("StrategySell") => Some(ExitReason::StrategySell),
                 None => None,
                 _ => return Err("Invalid exit reason".into()),
             };

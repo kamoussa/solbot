@@ -1,13 +1,16 @@
 use std::sync::{Arc, Mutex};
 
-use crate::execution::PositionManager;
+use crate::execution::{ExitReason, PositionManager};
 use crate::models::Signal;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionAction {
     Execute { quantity: f64 },
     Skip,
-    Close { position_id: uuid::Uuid },
+    Close {
+        position_id: uuid::Uuid,
+        exit_reason: ExitReason,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -67,12 +70,32 @@ impl Executor {
             Signal::Sell => {
                 // Check: Do we have this token?
                 if let Some(position) = pm.get_open_position(token) {
-                    Ok(ExecutionDecision {
-                        action: ExecutionAction::Close {
-                            position_id: position.id,
-                        },
-                        reason: "Sell signal on open position".to_string(),
-                    })
+                    // Calculate unrealized P&L %
+                    let unrealized_pnl_pct =
+                        (current_price - position.entry_price) / position.entry_price;
+
+                    // Only sell on technical signal if we're up at least 5%
+                    // This ensures technical exits are for profit-taking, not loss-cutting
+                    if unrealized_pnl_pct >= 0.05 {
+                        Ok(ExecutionDecision {
+                            action: ExecutionAction::Close {
+                                position_id: position.id,
+                                exit_reason: ExitReason::StrategySell,
+                            },
+                            reason: format!(
+                                "Sell signal with {:.1}% profit (>5% threshold)",
+                                unrealized_pnl_pct * 100.0
+                            ),
+                        })
+                    } else {
+                        Ok(ExecutionDecision {
+                            action: ExecutionAction::Skip,
+                            reason: format!(
+                                "Sell signal ignored - only {:.1}% profit (need >5%)",
+                                unrealized_pnl_pct * 100.0
+                            ),
+                        })
+                    }
                 } else {
                     Ok(ExecutionDecision {
                         action: ExecutionAction::Skip,
@@ -243,13 +266,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sell_signal_closes_position() {
+    fn test_sell_signal_closes_position_when_profitable() {
         let pm = Arc::new(Mutex::new(PositionManager::new(
             10000.0,
             CircuitBreakers::default(),
         )));
 
-        // Open a position first
+        // Open a position first at $100
         let position_id = pm
             .lock()
             .unwrap()
@@ -258,16 +281,64 @@ mod tests {
 
         let mut executor = Executor::new(pm);
 
-        // Process sell signal
+        // Process sell signal at $110 (10% profit, > 5% threshold)
         let decision = executor
             .process_signal(&Signal::Sell, "SOL", 110.0)
             .unwrap();
 
         assert!(matches!(
             decision.action,
-            ExecutionAction::Close { position_id: id } if id == position_id
+            ExecutionAction::Close { position_id: id, exit_reason: _ } if id == position_id
         ));
-        assert!(decision.reason.contains("Sell signal"));
+        assert!(decision.reason.contains("profit"));
+    }
+
+    #[test]
+    fn test_sell_signal_skips_when_profit_below_threshold() {
+        let pm = Arc::new(Mutex::new(PositionManager::new(
+            10000.0,
+            CircuitBreakers::default(),
+        )));
+
+        // Open position at $100
+        pm.lock()
+            .unwrap()
+            .open_position("SOL".to_string(), 100.0, 5.0)
+            .unwrap();
+
+        let mut executor = Executor::new(pm);
+
+        // Sell signal at $103 (only 3% profit, < 5% threshold)
+        let decision = executor
+            .process_signal(&Signal::Sell, "SOL", 103.0)
+            .unwrap();
+
+        assert!(matches!(decision.action, ExecutionAction::Skip));
+        assert!(decision.reason.contains("only 3.0% profit"));
+    }
+
+    #[test]
+    fn test_sell_signal_skips_when_losing() {
+        let pm = Arc::new(Mutex::new(PositionManager::new(
+            10000.0,
+            CircuitBreakers::default(),
+        )));
+
+        // Open position at $100
+        pm.lock()
+            .unwrap()
+            .open_position("SOL".to_string(), 100.0, 5.0)
+            .unwrap();
+
+        let mut executor = Executor::new(pm);
+
+        // Sell signal at $98 (losing -2%)
+        let decision = executor
+            .process_signal(&Signal::Sell, "SOL", 98.0)
+            .unwrap();
+
+        assert!(matches!(decision.action, ExecutionAction::Skip));
+        assert!(decision.reason.contains("-2.0% profit"));
     }
 
     #[test]
@@ -299,10 +370,10 @@ mod tests {
         assert!(matches!(decision.action, ExecutionAction::Close { .. }));
 
         // Close the position (simulating execution)
-        if let ExecutionAction::Close { position_id } = decision.action {
+        if let ExecutionAction::Close { position_id, exit_reason } = decision.action {
             pm.lock()
                 .unwrap()
-                .close_position(position_id, 110.0, crate::execution::ExitReason::Manual)
+                .close_position(position_id, 110.0, exit_reason)
                 .unwrap();
         }
 

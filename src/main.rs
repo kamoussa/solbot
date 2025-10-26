@@ -1233,10 +1233,14 @@ async fn execute_decision(
             )
             .await;
         }
-        ExecutionAction::Close { position_id } => {
+        ExecutionAction::Close {
+            position_id,
+            exit_reason,
+        } => {
             execute_close(
                 *position_id,
                 current_price,
+                exit_reason.clone(),
                 position_manager,
                 postgres_persistence,
             )
@@ -1288,16 +1292,13 @@ async fn execute_buy(
 async fn execute_close(
     position_id: uuid::Uuid,
     current_price: f64,
+    exit_reason: cryptobot::execution::ExitReason,
     position_manager: &Arc<Mutex<PositionManager>>,
     postgres_persistence: Option<&mut PostgresPersistence>,
 ) {
     let closed_position = {
         let mut pm = position_manager.lock().unwrap();
-        match pm.close_position(
-            position_id,
-            current_price,
-            cryptobot::execution::ExitReason::Manual,
-        ) {
+        match pm.close_position(position_id, current_price, exit_reason) {
             Ok(()) => {
                 tracing::info!(
                     "  ✓ Closed position {} @ ${:.4}",
