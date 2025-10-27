@@ -5,7 +5,9 @@ use crate::models::Signal;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionAction {
-    Execute { quantity: f64 },
+    Execute {
+        quantity: f64,
+    },
     Skip,
     Close {
         position_id: uuid::Uuid,
@@ -333,9 +335,7 @@ mod tests {
         let mut executor = Executor::new(pm);
 
         // Sell signal at $98 (losing -2%)
-        let decision = executor
-            .process_signal(&Signal::Sell, "SOL", 98.0)
-            .unwrap();
+        let decision = executor.process_signal(&Signal::Sell, "SOL", 98.0).unwrap();
 
         assert!(matches!(decision.action, ExecutionAction::Skip));
         assert!(decision.reason.contains("-2.0% profit"));
@@ -370,7 +370,11 @@ mod tests {
         assert!(matches!(decision.action, ExecutionAction::Close { .. }));
 
         // Close the position (simulating execution)
-        if let ExecutionAction::Close { position_id, exit_reason } = decision.action {
+        if let ExecutionAction::Close {
+            position_id,
+            exit_reason,
+        } = decision.action
+        {
             pm.lock()
                 .unwrap()
                 .close_position(position_id, 110.0, exit_reason)

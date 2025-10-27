@@ -287,14 +287,15 @@ impl PostgresPersistence {
     pub async fn save_tracked_token(&self, data: TrackedTokenData<'_>) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO tracked_tokens (symbol, address, name, decimals, strategy_type, status)
-            VALUES ($1, $2, $3, $4, $5, 'active')
+            INSERT INTO tracked_tokens (symbol, address, name, decimals, strategy_type, status, last_seen_trending)
+            VALUES ($1, $2, $3, $4, $5, 'active', NOW())
             ON CONFLICT (address) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
                 name = EXCLUDED.name,
                 decimals = EXCLUDED.decimals,
                 strategy_type = EXCLUDED.strategy_type,
                 status = 'active',
+                last_seen_trending = NOW(),
                 updated_at = NOW()
             "#,
         )
@@ -350,6 +351,107 @@ impl PostgresPersistence {
         sqlx::query("DELETE FROM tracked_tokens")
             .execute(&self.pool)
             .await?;
+
+        Ok(())
+    }
+
+    // ==================== TOKEN ROTATION METHODS ====================
+
+    /// Check if a token has any open positions (for any user)
+    /// Returns true if token has open positions, false otherwise
+    pub async fn token_has_open_positions(&self, symbol: &str) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM positions
+            WHERE token = $1 AND status = 'Open'
+            "#,
+        )
+        .bind(symbol)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let count: i64 = row.get("count");
+        Ok(count > 0)
+    }
+
+    /// Mark tokens as stale if they haven't been seen in trending for > 24h
+    /// Does NOT touch tokens with open positions or must-track tokens
+    /// Returns number of tokens marked as stale
+    pub async fn mark_stale_tokens(&self, must_track: &[&str]) -> Result<usize> {
+        let result = sqlx::query(
+            r#"
+            UPDATE tracked_tokens
+            SET status = 'stale', updated_at = NOW()
+            WHERE status = 'active'
+              AND last_seen_trending < NOW() - INTERVAL '24 hours'
+              AND symbol NOT IN (SELECT UNNEST($1::text[]))
+              AND address NOT IN (
+                SELECT DISTINCT address FROM tracked_tokens
+                WHERE symbol IN (
+                  SELECT DISTINCT token FROM positions WHERE status = 'Open'
+                )
+              )
+            "#,
+        )
+        .bind(must_track)
+        .execute(&self.pool)
+        .await?;
+
+        let count = result.rows_affected() as usize;
+        if count > 0 {
+            tracing::info!("Marked {} tokens as stale (not seen in 24h)", count);
+        }
+
+        Ok(count)
+    }
+
+    /// Mark tokens as removed if they haven't been seen in trending for > 7 days
+    /// Does NOT touch tokens with open positions or must-track tokens
+    /// Returns number of tokens marked as removed
+    pub async fn mark_removed_tokens(&self, must_track: &[&str]) -> Result<usize> {
+        let result = sqlx::query(
+            r#"
+            UPDATE tracked_tokens
+            SET status = 'removed', updated_at = NOW()
+            WHERE status IN ('active', 'stale')
+              AND last_seen_trending < NOW() - INTERVAL '7 days'
+              AND symbol NOT IN (SELECT UNNEST($1::text[]))
+              AND address NOT IN (
+                SELECT DISTINCT address FROM tracked_tokens
+                WHERE symbol IN (
+                  SELECT DISTINCT token FROM positions WHERE status = 'Open'
+                )
+              )
+            "#,
+        )
+        .bind(must_track)
+        .execute(&self.pool)
+        .await?;
+
+        let count = result.rows_affected() as usize;
+        if count > 0 {
+            tracing::warn!("Marked {} tokens as removed (not seen in 7 days)", count);
+        }
+
+        Ok(count)
+    }
+
+    /// Re-activate a token that was previously stale/removed (e.g., it reappeared in trending)
+    /// This is automatically handled by save_tracked_token, but can be called explicitly
+    pub async fn reactivate_token(&self, address: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE tracked_tokens
+            SET status = 'active', last_seen_trending = NOW(), updated_at = NOW()
+            WHERE address = $1 AND status IN ('stale', 'removed')
+            "#,
+        )
+        .bind(address)
+        .execute(&self.pool)
+        .await?;
+
+        tracing::info!("Reactivated token at address {}", address);
 
         Ok(())
     }
@@ -589,5 +691,311 @@ mod tests {
         assert_eq!(total_pnl, 12.0); // 20 + (-8)
 
         db.clear_all_positions().await.unwrap();
+    }
+
+    // ==================== TOKEN ROTATION TESTS ====================
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_mark_stale_tokens_after_24h() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+
+        // Add a token that hasn't been seen in 25 hours
+        let token = TrackedTokenData {
+            symbol: "OLDCOIN",
+            address: "OldCoin111111111111111111111111111111111",
+            name: "Old Coin",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token).await.unwrap();
+
+        // Manually backdate last_seen_trending to 25 hours ago
+        sqlx::query(
+            "UPDATE tracked_tokens SET last_seen_trending = NOW() - INTERVAL '25 hours' WHERE symbol = 'OLDCOIN'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Mark stale tokens (no must-track protection)
+        let count = db.mark_stale_tokens(&[]).await.unwrap();
+        assert_eq!(count, 1);
+
+        // Verify token is now stale
+        let row = sqlx::query("SELECT status FROM tracked_tokens WHERE symbol = 'OLDCOIN'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(status, "stale");
+
+        db.clear_all_tracked_tokens().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_mark_stale_tokens_protects_must_track() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+
+        // Add SOL (must-track) with old timestamp
+        let sol = TrackedTokenData {
+            symbol: "SOL",
+            address: "So11111111111111111111111111111111111111112",
+            name: "Solana",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(sol).await.unwrap();
+
+        // Backdate to 25 hours ago
+        sqlx::query(
+            "UPDATE tracked_tokens SET last_seen_trending = NOW() - INTERVAL '25 hours' WHERE symbol = 'SOL'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Mark stale with SOL protected
+        let count = db.mark_stale_tokens(&["SOL"]).await.unwrap();
+        assert_eq!(count, 0); // SOL should NOT be marked stale
+
+        // Verify SOL is still active
+        let row = sqlx::query("SELECT status FROM tracked_tokens WHERE symbol = 'SOL'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(status, "active");
+
+        db.clear_all_tracked_tokens().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_mark_stale_tokens_protects_open_positions() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+        db.clear_all_positions().await.unwrap();
+
+        // Add token with old timestamp
+        let token = TrackedTokenData {
+            symbol: "TRADED",
+            address: "TradedCoin11111111111111111111111111111",
+            name: "Traded Coin",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token).await.unwrap();
+
+        // Backdate to 25 hours ago
+        sqlx::query(
+            "UPDATE tracked_tokens SET last_seen_trending = NOW() - INTERVAL '25 hours' WHERE symbol = 'TRADED'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Create open position for this token
+        let position = Position {
+            id: Uuid::new_v4(),
+            token: "TRADED".to_string(),
+            entry_price: 100.0,
+            quantity: 10.0,
+            entry_time: Utc::now(),
+            stop_loss: 92.0,
+            take_profit: None,
+            trailing_high: 100.0,
+            status: PositionStatus::Open,
+            realized_pnl: None,
+            exit_price: None,
+            exit_time: None,
+            exit_reason: None,
+        };
+        db.save_position(&position).await.unwrap();
+
+        // Try to mark stale
+        let count = db.mark_stale_tokens(&[]).await.unwrap();
+        assert_eq!(count, 0); // Should NOT be marked stale due to open position
+
+        // Verify still active
+        let row = sqlx::query("SELECT status FROM tracked_tokens WHERE symbol = 'TRADED'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(status, "active");
+
+        db.clear_all_positions().await.unwrap();
+        db.clear_all_tracked_tokens().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_mark_removed_tokens_after_7_days() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+
+        // Add a token that hasn't been seen in 8 days
+        let token = TrackedTokenData {
+            symbol: "ANCIENT",
+            address: "AncientCoin1111111111111111111111111111",
+            name: "Ancient Coin",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token).await.unwrap();
+
+        // Backdate to 8 days ago
+        sqlx::query(
+            "UPDATE tracked_tokens SET last_seen_trending = NOW() - INTERVAL '8 days' WHERE symbol = 'ANCIENT'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Mark removed
+        let count = db.mark_removed_tokens(&[]).await.unwrap();
+        assert_eq!(count, 1);
+
+        // Verify token is now removed
+        let row = sqlx::query("SELECT status FROM tracked_tokens WHERE symbol = 'ANCIENT'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(status, "removed");
+
+        db.clear_all_tracked_tokens().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_reactivate_token() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+
+        // Add a stale token
+        let token = TrackedTokenData {
+            symbol: "COMEBACK",
+            address: "ComebackCoin111111111111111111111111111",
+            name: "Comeback Coin",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token).await.unwrap();
+
+        // Manually mark as stale
+        sqlx::query("UPDATE tracked_tokens SET status = 'stale' WHERE symbol = 'COMEBACK'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Reactivate it
+        db.reactivate_token("ComebackCoin111111111111111111111111111")
+            .await
+            .unwrap();
+
+        // Verify it's active again
+        let row = sqlx::query("SELECT status FROM tracked_tokens WHERE symbol = 'COMEBACK'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(status, "active");
+
+        db.clear_all_tracked_tokens().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_token_has_open_positions() {
+        let db = get_test_db().await;
+        db.clear_all_positions().await.unwrap();
+
+        // No positions yet
+        let has_positions = db.token_has_open_positions("SOL").await.unwrap();
+        assert!(!has_positions);
+
+        // Add open position
+        let position = Position {
+            id: Uuid::new_v4(),
+            token: "SOL".to_string(),
+            entry_price: 100.0,
+            quantity: 10.0,
+            entry_time: Utc::now(),
+            stop_loss: 92.0,
+            take_profit: None,
+            trailing_high: 100.0,
+            status: PositionStatus::Open,
+            realized_pnl: None,
+            exit_price: None,
+            exit_time: None,
+            exit_reason: None,
+        };
+        db.save_position(&position).await.unwrap();
+
+        // Now should return true
+        let has_positions = db.token_has_open_positions("SOL").await.unwrap();
+        assert!(has_positions);
+
+        // Different token should return false
+        let has_positions = db.token_has_open_positions("JUP").await.unwrap();
+        assert!(!has_positions);
+
+        db.clear_all_positions().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Postgres running
+    async fn test_save_tracked_token_updates_last_seen() {
+        let db = get_test_db().await;
+        db.clear_all_tracked_tokens().await.unwrap();
+
+        // Save token first time
+        let token = TrackedTokenData {
+            symbol: "REFRESH",
+            address: "RefreshCoin111111111111111111111111111",
+            name: "Refresh Coin",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token).await.unwrap();
+
+        // Get initial timestamp
+        let row1 =
+            sqlx::query("SELECT last_seen_trending FROM tracked_tokens WHERE symbol = 'REFRESH'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let first_seen: chrono::DateTime<Utc> = row1.get("last_seen_trending");
+
+        // Wait a moment
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Save again (simulate rediscovery)
+        let token2 = TrackedTokenData {
+            symbol: "REFRESH",
+            address: "RefreshCoin111111111111111111111111111",
+            name: "Refresh Coin Updated",
+            decimals: 9,
+            strategy_type: "momentum",
+        };
+        db.save_tracked_token(token2).await.unwrap();
+
+        // Get updated timestamp
+        let row2 =
+            sqlx::query("SELECT last_seen_trending FROM tracked_tokens WHERE symbol = 'REFRESH'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let second_seen: chrono::DateTime<Utc> = row2.get("last_seen_trending");
+
+        // Second timestamp should be later
+        assert!(second_seen > first_seen);
+
+        db.clear_all_tracked_tokens().await.unwrap();
     }
 }

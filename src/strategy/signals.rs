@@ -161,7 +161,8 @@ pub fn analyze_market_conditions(
     // ==================== PANIC BUY LOGIC ====================
     // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)
     // IMPORTANT: Panic buy requires volume spike confirmation, so skip if no volume data
-    if has_volume_data && config.enable_panic_buy && prices.len() > config.panic_drop_window_candles {
+    if has_volume_data && config.enable_panic_buy && prices.len() > config.panic_drop_window_candles
+    {
         let window_start = prices
             .len()
             .saturating_sub(config.panic_drop_window_candles);

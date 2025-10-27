@@ -626,6 +626,40 @@ async fn save_tracked_tokens_to_db(
     }
 }
 
+/// Run token rotation: mark stale and removed tokens
+///
+/// - Stale: not seen in trending for > 24h (stops price fetching)
+/// - Removed: not seen in trending for > 7d (archived)
+/// - Protects: must-track tokens (SOL, JUP) and tokens with open positions
+async fn run_token_rotation(postgres: &PostgresPersistence) {
+    // Extract must-track symbols from MUST_TRACK constant
+    let must_track_symbols: Vec<&str> = MUST_TRACK.iter().map(|(_, symbol)| *symbol).collect();
+
+    // Mark tokens stale if not seen in 24h
+    match postgres.mark_stale_tokens(&must_track_symbols).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!("  🔄 Marked {} tokens as stale (not seen in 24h)", count);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("  ⚠️  Failed to mark stale tokens: {}", e);
+        }
+    }
+
+    // Mark tokens removed if not seen in 7 days
+    match postgres.mark_removed_tokens(&must_track_symbols).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::warn!("  🗑️  Marked {} tokens as removed (not seen in 7d)", count);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("  ⚠️  Failed to mark removed tokens: {}", e);
+        }
+    }
+}
+
 fn convert_to_tokens(trending_tokens: &[TrendingToken]) -> Vec<Token> {
     trending_tokens
         .iter()
@@ -907,6 +941,12 @@ async fn token_discovery_loop(
             Ok(final_tokens) => {
                 tracing::info!("  ✓ Discovered {} tokens", final_tokens.len());
 
+                // Run token rotation BEFORE saving new tokens
+                // This marks stale/removed tokens, then saving reactivates trending ones
+                if let Some(ref pg) = postgres {
+                    run_token_rotation(pg).await;
+                }
+
                 // Check which tokens need backfilling (new OR insufficient data)
                 let tokens_to_backfill = if coingecko_client.is_some() {
                     identify_tokens_needing_backfill(&final_tokens, &redis_url).await
@@ -928,6 +968,7 @@ async fn token_discovery_loop(
                 }
 
                 // Save to database
+                // This will reactivate tokens that were previously stale/removed if they're trending again
                 if let Some(mut pg) = postgres {
                     save_tracked_tokens_to_db(&mut pg, &final_tokens).await;
                 }

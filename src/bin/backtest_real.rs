@@ -29,11 +29,7 @@ async fn main() -> Result<()> {
     let mut redis = RedisPersistence::new(&redis_url).await?;
 
     // Tokens to backtest (must have data in Redis)
-    let tokens = vec![
-        ("SOL", "Solana"),
-        ("JUP", "Jupiter"),
-        ("Bonk", "Bonk"),
-    ];
+    let tokens = vec![("SOL", "Solana"), ("JUP", "Jupiter"), ("Bonk", "Bonk")];
 
     let runner = BacktestRunner::new(initial_portfolio_value, circuit_breakers);
     let mut all_metrics = Vec::new();
@@ -46,7 +42,10 @@ async fn main() -> Result<()> {
             Ok(candles) => {
                 if candles.is_empty() {
                     println!("⚠️  No data available for {} - skipping", symbol);
-                    println!("   Run: cargo run --bin cryptobot backfill {} <address> --days 1", symbol);
+                    println!(
+                        "   Run: cargo run --bin cryptobot backfill {} <address> --days 1",
+                        symbol
+                    );
                     continue;
                 }
 
@@ -59,7 +58,10 @@ async fn main() -> Result<()> {
                 println!(
                     "  Price range: ${:.2} - ${:.2}",
                     candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min),
-                    candles.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max)
+                    candles
+                        .iter()
+                        .map(|c| c.high)
+                        .fold(f64::NEG_INFINITY, f64::max)
                 );
 
                 // Run backtest
@@ -74,7 +76,10 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 println!("❌ Failed to load data for {}: {}", symbol, e);
-                println!("   Run: cargo run --bin cryptobot backfill {} <address> --days 1", symbol);
+                println!(
+                    "   Run: cargo run --bin cryptobot backfill {} <address> --days 1",
+                    symbol
+                );
             }
         }
     }
@@ -168,14 +173,26 @@ fn print_summary_comparison(results: &[(String, cryptobot::backtest::BacktestMet
     };
 
     if health_ratio >= 66.0 {
-        println!("   ✅ HEALTHY: {}/{} tokens profitable ({:.0}%)",
-            profitable_count, results.len(), health_ratio);
+        println!(
+            "   ✅ HEALTHY: {}/{} tokens profitable ({:.0}%)",
+            profitable_count,
+            results.len(),
+            health_ratio
+        );
     } else if health_ratio >= 33.0 {
-        println!("   ⚠️  MARGINAL: {}/{} tokens profitable ({:.0}%)",
-            profitable_count, results.len(), health_ratio);
+        println!(
+            "   ⚠️  MARGINAL: {}/{} tokens profitable ({:.0}%)",
+            profitable_count,
+            results.len(),
+            health_ratio
+        );
     } else {
-        println!("   ❌ POOR: {}/{} tokens profitable ({:.0}%)",
-            profitable_count, results.len(), health_ratio);
+        println!(
+            "   ❌ POOR: {}/{} tokens profitable ({:.0}%)",
+            profitable_count,
+            results.len(),
+            health_ratio
+        );
     }
 
     println!("\n═══════════════════════════════════════════════════════\n");
