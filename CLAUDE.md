@@ -10,6 +10,27 @@ CryptoBot is a Solana-based cryptocurrency trading bot using swing trading strat
 
 Note: you keep trying to use the timeout command but it doesn't exist. Stop trying to use it.
 
+### Railway Database Access
+
+**IMPORTANT**: When accessing Railway Redis or Postgres, ALWAYS use echo to pipe commands instead of interactive shells:
+
+```bash
+# Redis - CORRECT (use echo)
+echo "KEYS snapshots:*" | railway connect redis
+echo "ZCARD snapshots:SOL" | railway connect redis
+echo "ZRANGE snapshots:SOL 0 5 WITHSCORES" | railway connect redis
+
+# Redis - WRONG (don't use -c flag, interactive doesn't work)
+railway connect redis -c "KEYS snapshots:*"  # ❌ FAILS
+
+# Postgres - CORRECT (use echo)
+echo "SELECT COUNT(*) FROM tracked_tokens;" | railway connect postgres
+echo "\dt" | railway connect postgres
+
+# Postgres - WRONG (don't use -c flag, interactive doesn't work)
+railway connect postgres -c "\dt"  # ❌ FAILS
+```
+
 ### Build and Test
 ```bash
 # Build the project

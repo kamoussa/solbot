@@ -1,6 +1,7 @@
 use cryptobot::backtest::BacktestRunner;
 use cryptobot::persistence::RedisPersistence;
 use cryptobot::risk::CircuitBreakers;
+use cryptobot::strategy::buy_and_hold::BuyAndHoldStrategy;
 use cryptobot::strategy::momentum::MomentumStrategy;
 use cryptobot::Result;
 
@@ -12,14 +13,17 @@ async fn main() -> Result<()> {
         .init();
 
     println!("\n╔═══════════════════════════════════════════════════════╗");
-    println!("║     CRYPTOBOT REAL DATA BACKTESTING SUITE            ║");
+    println!("║     CRYPTOBOT STRATEGY COMPARISON SUITE               ║");
     println!("╚═══════════════════════════════════════════════════════╝");
-    println!("Using real CoinGecko data from Redis\n");
+    println!("Comparing strategies on real CoinGecko data from Redis\n");
 
     // Configuration
     let initial_portfolio_value = 10000.0;
     let circuit_breakers = CircuitBreakers::default();
-    let strategy = MomentumStrategy::default();
+
+    // Strategies to test
+    let buy_and_hold = BuyAndHoldStrategy::default();
+    let momentum = MomentumStrategy::default();
 
     // Connect to Redis
     let redis_url =
@@ -29,23 +33,51 @@ async fn main() -> Result<()> {
     let mut redis = RedisPersistence::new(&redis_url).await?;
 
     // Tokens to backtest (must have data in Redis)
-    let tokens = vec![("SOL", "Solana"), ("JUP", "Jupiter"), ("Bonk", "Bonk")];
+    //let tokens = vec![("SOL", "Solana"), ("JUP", "Jupiter"), ("Bonk", "Bonk")];
+    //  1) "snapshots:KMNO"
+    //  2) "snapshots:USELESS"
+    //  3) "snapshots:PUMP"
+    //  4) "snapshots:WBTC"
+    //  5) "snapshots:URANUS"
+    //  6) "snapshots:PENGU"
+    //  7) "snapshots:WETH"
+    //  8) "snapshots:BOT"
+    //  9) "snapshots:SPX"
+    // 10) "snapshots:RAY"
+    // 11) "snapshots:SOL"
+    // 12) "snapshots:TROLL"
+    // 13) "snapshots:Bonk"
+    // 14) "snapshots:JUP"
+    // 15) "snapshots:TRUMP"
+    let tokens = vec![
+        ("SOL", "Solana"),
+        ("JUP", "Jupiter"),
+        ("Bonk", "Bonk"),
+        ("TRUMP", "Trump"),
+        ("USELESS", "USELESS"),
+        ("PUMP", "PUMP"),
+        ("WBTC", "WBTC"),
+        ("URANUS", "URANUS"),
+        ("PENGU", "PENGU"),
+        ("WETH", "WETH"),
+        ("BOT", "BOT"),
+        ("SPX", "SPX"),
+        ("RAY", "RAY"),
+        ("TROLL", "TROLL"),
+        ("KMNO", "KMNO"),
+    ];
 
-    let runner = BacktestRunner::new(initial_portfolio_value, circuit_breakers);
-    let mut all_metrics = Vec::new();
+    let mut all_results: Vec<(String, String, cryptobot::backtest::BacktestMetrics)> = Vec::new();
 
     for (symbol, name) in &tokens {
-        println!("\n🔍 Loading data for {}...", name);
+        println!("\n📊 Loading data for {}...", name);
 
         // Load candles from Redis (7 days = 2016 candles at 5-min intervals)
         match redis.load_candles(symbol, 2016).await {
             Ok(candles) => {
                 if candles.is_empty() {
                     println!("⚠️  No data available for {} - skipping", symbol);
-                    println!(
-                        "   Run: cargo run --bin cryptobot backfill {} <address> --days 1",
-                        symbol
-                    );
+                    println!("   Run: cargo run backfill {} <address> --days 1", symbol);
                     continue;
                 }
 
@@ -64,134 +96,186 @@ async fn main() -> Result<()> {
                         .fold(f64::NEG_INFINITY, f64::max)
                 );
 
-                // Run backtest
-                match runner.run_and_report(&strategy, candles, symbol, name) {
-                    Ok(metrics) => {
-                        all_metrics.push((format!("{} ({})", name, symbol), metrics));
+                // Test Buy & Hold strategy
+                {
+                    let runner =
+                        BacktestRunner::new(initial_portfolio_value, circuit_breakers.clone());
+                    println!("\n  🔬 Testing Buy & Hold strategy...");
+
+                    match runner.run(&buy_and_hold, candles.clone(), symbol) {
+                        Ok(metrics) => {
+                            all_results.push((
+                                name.to_string(),
+                                "Buy & Hold".to_string(),
+                                metrics.clone(),
+                            ));
+                            println!(
+                                "     Result: {:+.2}% ({} trades)",
+                                metrics.total_return_pct, metrics.total_trades
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("     ❌ Failed: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("❌ Backtest failed for {}: {}", name, e);
+                }
+
+                // Test Momentum strategy
+                {
+                    let runner =
+                        BacktestRunner::new(initial_portfolio_value, circuit_breakers.clone());
+                    println!("\n  🔬 Testing Momentum strategy...");
+
+                    match runner.run(&momentum, candles.clone(), symbol) {
+                        Ok(metrics) => {
+                            all_results.push((
+                                name.to_string(),
+                                "Momentum".to_string(),
+                                metrics.clone(),
+                            ));
+                            println!(
+                                "     Result: {:+.2}% ({} trades)",
+                                metrics.total_return_pct, metrics.total_trades
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("     ❌ Failed: {}", e);
+                        }
                     }
                 }
             }
             Err(e) => {
                 println!("❌ Failed to load data for {}: {}", symbol, e);
-                println!(
-                    "   Run: cargo run --bin cryptobot backfill {} <address> --days 1",
-                    symbol
-                );
+                println!("   Run: cargo run backfill {} <address> --days 1", symbol);
             }
         }
     }
 
-    if all_metrics.is_empty() {
+    if all_results.is_empty() {
         println!("\n⚠️  No backtests could run - no data available in Redis");
         println!("\nTo populate data, run:");
-        println!("  cargo run --bin cryptobot backfill SOL So11111111111111111111111111111111111111112 --days 1");
-        println!("  cargo run --bin cryptobot backfill JUP JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN --days 1");
+        println!("  cargo run backfill SOL So11111111111111111111111111111111111111112 --days 1");
+        println!("  cargo run backfill JUP JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN --days 1");
         return Ok(());
     }
 
-    // Summary comparison
-    print_summary_comparison(&all_metrics);
+    // Print comparison table
+    print_strategy_comparison(&all_results);
 
     Ok(())
 }
 
-fn print_summary_comparison(results: &[(String, cryptobot::backtest::BacktestMetrics)]) {
+fn print_strategy_comparison(results: &[(String, String, cryptobot::backtest::BacktestMetrics)]) {
     println!("\n╔═══════════════════════════════════════════════════════╗");
-    println!("║              REAL DATA COMPARISON                     ║");
+    println!("║           STRATEGY COMPARISON RESULTS                 ║");
     println!("╚═══════════════════════════════════════════════════════╝\n");
 
-    println!(
-        "{:<30} {:>10} {:>10} {:>8} {:>8}",
-        "Token", "P&L", "Return%", "Trades", "Win%"
-    );
-    println!("{}", "─".repeat(70));
+    // Group results by token
+    let tokens: Vec<String> = results
+        .iter()
+        .map(|(token, _, _)| token.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
-    for (name, metrics) in results {
+    for token in &tokens {
+        println!("\n📈 {}:", token);
+        println!("{}", "─".repeat(70));
         println!(
-            "{:<30} {:>10.2} {:>10.2} {:>8} {:>8.1}",
-            name,
-            metrics.total_pnl,
-            metrics.total_return_pct,
-            metrics.total_trades,
-            metrics.win_rate
+            "{:<20} {:>10} {:>10} {:>8} {:>8}",
+            "Strategy", "P&L", "Return%", "Trades", "Win%"
         );
+        println!("{}", "─".repeat(70));
+
+        let token_results: Vec<_> = results.iter().filter(|(t, _, _)| t == token).collect();
+
+        for (_, strategy, metrics) in &token_results {
+            println!(
+                "{:<20} {:>10.2} {:>10.2} {:>8} {:>8.1}",
+                strategy,
+                metrics.total_pnl,
+                metrics.total_return_pct,
+                metrics.total_trades,
+                metrics.win_rate
+            );
+        }
+
+        // Find best strategy for this token
+        if let Some(best) = token_results.iter().max_by(|a, b| {
+            a.2.total_return_pct
+                .partial_cmp(&b.2.total_return_pct)
+                .unwrap()
+        }) {
+            println!(
+                "\n   🏆 Best for {}: {} ({:+.2}%)",
+                token, best.1, best.2.total_return_pct
+            );
+        }
     }
 
-    println!("\n");
+    // Overall summary
+    println!("\n\n╔═══════════════════════════════════════════════════════╗");
+    println!("║              OVERALL SUMMARY                          ║");
+    println!("╚═══════════════════════════════════════════════════════╝\n");
 
-    // Find best/worst
-    if let Some((best_name, best_metrics)) = results.iter().max_by(|a, b| {
-        a.1.total_return_pct
-            .partial_cmp(&b.1.total_return_pct)
-            .unwrap()
+    let strategies: Vec<String> = results
+        .iter()
+        .map(|(_, strategy, _)| strategy.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    for strategy in &strategies {
+        let strategy_results: Vec<_> = results.iter().filter(|(_, s, _)| s == strategy).collect();
+
+        let avg_return: f64 = strategy_results
+            .iter()
+            .map(|(_, _, m)| m.total_return_pct)
+            .sum::<f64>()
+            / strategy_results.len() as f64;
+
+        let total_trades: usize = strategy_results
+            .iter()
+            .map(|(_, _, m)| m.total_trades)
+            .sum();
+
+        let avg_win_rate: f64 = strategy_results
+            .iter()
+            .map(|(_, _, m)| m.win_rate)
+            .sum::<f64>()
+            / strategy_results.len() as f64;
+
+        let win_count = strategy_results
+            .iter()
+            .filter(|(_, _, m)| m.total_return_pct > 0.0)
+            .count();
+
+        println!("📊 {} Strategy:", strategy);
+        println!("   Average Return: {:+.2}%", avg_return);
+        println!("   Total Trades: {}", total_trades);
+        println!("   Average Win Rate: {:.1}%", avg_win_rate);
+        println!(
+            "   Profitable Tokens: {}/{} ({:.0}%)",
+            win_count,
+            strategy_results.len(),
+            (win_count as f64 / strategy_results.len() as f64) * 100.0
+        );
+        println!();
+    }
+
+    // Verdict
+    if let Some(best_strategy) = strategies.iter().max_by_key(|s| {
+        let strategy_results: Vec<_> = results.iter().filter(|(_, strat, _)| strat == *s).collect();
+        let avg_return = strategy_results
+            .iter()
+            .map(|(_, _, m)| m.total_return_pct)
+            .sum::<f64>()
+            / strategy_results.len() as f64;
+        (avg_return * 100.0) as i64 // Convert to basis points for integer comparison
     }) {
         println!(
-            "🏆 Best Performer: {} ({:+.2}%)",
-            best_name, best_metrics.total_return_pct
-        );
-    }
-
-    if let Some((worst_name, worst_metrics)) = results.iter().min_by(|a, b| {
-        a.1.total_return_pct
-            .partial_cmp(&b.1.total_return_pct)
-            .unwrap()
-    }) {
-        println!(
-            "⚠️  Worst Performer: {} ({:+.2}%)",
-            worst_name, worst_metrics.total_return_pct
-        );
-    }
-
-    // Overall statistics
-    let total_trades: usize = results.iter().map(|(_, m)| m.total_trades).sum();
-    let avg_return: f64 = if !results.is_empty() {
-        results.iter().map(|(_, m)| m.total_return_pct).sum::<f64>() / results.len() as f64
-    } else {
-        0.0
-    };
-    let avg_win_rate: f64 = if !results.is_empty() {
-        results.iter().map(|(_, m)| m.win_rate).sum::<f64>() / results.len() as f64
-    } else {
-        0.0
-    };
-
-    println!("\n📊 Overall Statistics:");
-    println!("   Total Trades Across All Tokens: {}", total_trades);
-    println!("   Average Return: {:+.2}%", avg_return);
-    println!("   Average Win Rate: {:.1}%", avg_win_rate);
-
-    // Strategy health check
-    println!("\n🏥 Strategy Health Check:");
-    let profitable_count = results.iter().filter(|(_, m)| m.total_pnl > 0.0).count();
-    let health_ratio = if !results.is_empty() {
-        (profitable_count as f64 / results.len() as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    if health_ratio >= 66.0 {
-        println!(
-            "   ✅ HEALTHY: {}/{} tokens profitable ({:.0}%)",
-            profitable_count,
-            results.len(),
-            health_ratio
-        );
-    } else if health_ratio >= 33.0 {
-        println!(
-            "   ⚠️  MARGINAL: {}/{} tokens profitable ({:.0}%)",
-            profitable_count,
-            results.len(),
-            health_ratio
-        );
-    } else {
-        println!(
-            "   ❌ POOR: {}/{} tokens profitable ({:.0}%)",
-            profitable_count,
-            results.len(),
-            health_ratio
+            "\n🎯 VERDICT: {} strategy performs best on average",
+            best_strategy
         );
     }
 

@@ -750,26 +750,27 @@ async fn price_fetch_loop(tokens: Arc<RwLock<Vec<Token>>>, redis_url: String) {
         }
 
         // Periodic cleanup: remove data older than 48 hours
-        if tick_count % CLEANUP_INTERVAL == 0 {
-            tracing::info!("🧹 Running Redis cleanup (keeping last {}h)...", KEEP_HOURS);
+        // TODO: reenable cleanup when appropriate. we want to accumulate data for backtesting, not just keep the last 48 hours.
+        //if tick_count % CLEANUP_INTERVAL == 0 {
+        //    tracing::info!("🧹 Running Redis cleanup (keeping last {}h)...", KEEP_HOURS);
 
-            for token in &token_list {
-                match redis.cleanup_old(&token.symbol, KEEP_HOURS).await {
-                    Ok(removed) => {
-                        if removed > 0 {
-                            tracing::info!(
-                                "  ✓ Cleaned up {} old snapshots for {}",
-                                removed,
-                                token.symbol
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("  ✗ Failed to cleanup {}: {}", token.symbol, e);
-                    }
-                }
-            }
-        }
+        //    for token in &token_list {
+        //        match redis.cleanup_old(&token.symbol, KEEP_HOURS).await {
+        //            Ok(removed) => {
+        //                if removed > 0 {
+        //                    tracing::info!(
+        //                        "  ✓ Cleaned up {} old snapshots for {}",
+        //                        removed,
+        //                        token.symbol
+        //                    );
+        //                }
+        //            }
+        //            Err(e) => {
+        //                tracing::warn!("  ✗ Failed to cleanup {}: {}", token.symbol, e);
+        //            }
+        //        }
+        //    }
+        //}
     }
 }
 
