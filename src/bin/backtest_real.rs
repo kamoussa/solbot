@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
 
     // Strategies to test
     let buy_and_hold = BuyAndHoldStrategy::default();
-    let momentum = MomentumStrategy::default();
+    let momentum = MomentumStrategy::default().with_poll_interval(60);
 
     // Connect to Redis
     let redis_url =
@@ -81,7 +81,25 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                println!("✓ Loaded {} candles for {}", candles.len(), name);
+                // Detect granularity from candle intervals
+                let (granularity, poll_interval) = if candles.len() > 1 {
+                    let interval_secs = (candles[1].timestamp - candles[0].timestamp).num_seconds();
+                    if interval_secs >= 3000 {
+                        // >= 50 minutes (allow some variance)
+                        ("hourly", 60)
+                    } else {
+                        ("5-minute", 5)
+                    }
+                } else {
+                    ("unknown", 5)
+                };
+
+                println!(
+                    "✓ Loaded {} {} candles for {}",
+                    candles.len(),
+                    granularity,
+                    name
+                );
                 println!(
                     "  Period: {} to {}",
                     candles.first().unwrap().timestamp,
@@ -102,7 +120,7 @@ async fn main() -> Result<()> {
                         BacktestRunner::new(initial_portfolio_value, circuit_breakers.clone());
                     println!("\n  🔬 Testing Buy & Hold strategy...");
 
-                    match runner.run(&buy_and_hold, candles.clone(), symbol) {
+                    match runner.run(&buy_and_hold, candles.clone(), symbol, poll_interval) {
                         Ok(metrics) => {
                             all_results.push((
                                 name.to_string(),
@@ -126,7 +144,7 @@ async fn main() -> Result<()> {
                         BacktestRunner::new(initial_portfolio_value, circuit_breakers.clone());
                     println!("\n  🔬 Testing Momentum strategy...");
 
-                    match runner.run(&momentum, candles.clone(), symbol) {
+                    match runner.run(&momentum, candles.clone(), symbol, poll_interval) {
                         Ok(metrics) => {
                             all_results.push((
                                 name.to_string(),

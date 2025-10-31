@@ -800,8 +800,10 @@ async fn trading_execution_loop(
         None
     };
 
-    let strategy = MomentumStrategy::default().with_poll_interval(POLL_INTERVAL_MINUTES);
-    let samples_needed = strategy.samples_needed(POLL_INTERVAL_MINUTES);
+    // We'll create strategies per-token with their specific RSI thresholds
+    // Default strategy is used for samples_needed calculation
+    let default_strategy = MomentumStrategy::default().with_poll_interval(POLL_INTERVAL_MINUTES);
+    let samples_needed = default_strategy.samples_needed(POLL_INTERVAL_MINUTES);
     let mut executor = Executor::new(state.position_manager.clone());
 
     // Create interval starting 30 seconds after next 5-minute boundary
@@ -823,8 +825,25 @@ async fn trading_execution_loop(
 
         // Load candles from Redis for all tokens
         for token in &tokens {
+            // Load per-token RSI threshold from database
+            let rsi_threshold = if let Some(ref pg) = postgres {
+                pg.get_rsi_threshold(&token.symbol).await.unwrap_or(45.0)
+            } else {
+                45.0 // Default if no database
+            };
+
+            // Create token-specific strategy with its optimal RSI threshold
+            let token_strategy = {
+                use cryptobot::strategy::signals::SignalConfig;
+                let config = SignalConfig {
+                    rsi_oversold: rsi_threshold,
+                    ..Default::default()
+                };
+                MomentumStrategy::new(config).with_poll_interval(POLL_INTERVAL_MINUTES)
+            };
+
             match redis
-                .load_candles(&token.symbol, strategy.lookback_hours())
+                .load_candles(&token.symbol, token_strategy.lookback_hours())
                 .await
             {
                 Ok(candles) => {
@@ -843,16 +862,17 @@ async fn trading_execution_loop(
                         prices.insert(token.symbol.clone(), latest.close);
 
                         tracing::info!(
-                            "  {} @ ${:.4} ({} candles)",
+                            "  {} @ ${:.4} ({} candles, RSI < {:.0})",
                             token.symbol,
                             latest.close,
-                            candles.len()
+                            candles.len(),
+                            rsi_threshold
                         );
 
                         // Generate signals if we have enough data
                         if candles.len() >= samples_needed {
                             process_token_signal(
-                                &strategy,
+                                &token_strategy,
                                 token,
                                 &candles,
                                 latest.close,
@@ -972,6 +992,10 @@ async fn token_discovery_loop(
                 // This will reactivate tokens that were previously stale/removed if they're trending again
                 if let Some(mut pg) = postgres {
                     save_tracked_tokens_to_db(&mut pg, &final_tokens).await;
+
+                    // Calculate optimal RSI thresholds for tokens that need it
+                    // (new tokens or tokens with sufficient data that haven't been tuned yet)
+                    tune_rsi_for_new_tokens(&pg, &final_tokens, &redis_url).await;
                 }
 
                 // Update shared token list
@@ -1178,6 +1202,138 @@ async fn spawn_backfill_tasks(
             }
         });
     }
+}
+
+// ============================================================================
+// RSI Threshold Calculation
+// ============================================================================
+
+/// Tune RSI thresholds for newly discovered tokens with sufficient data
+async fn tune_rsi_for_new_tokens(
+    postgres: &PostgresPersistence,
+    tokens: &[TrendingToken],
+    redis_url: &str,
+) {
+    // Connect to Redis
+    let mut redis = match RedisPersistence::new(redis_url).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to connect to Redis for RSI tuning: {}", e);
+            return;
+        }
+    };
+
+    for token in tokens {
+        // Check if token already has a non-default threshold
+        match postgres.get_rsi_threshold(&token.symbol).await {
+            Ok(threshold) if (threshold - 45.0).abs() < 0.1 => {
+                // Has default threshold (45.0), needs tuning
+                tracing::debug!("{} has default RSI threshold, checking for tuning", token.symbol);
+            }
+            Ok(_) => {
+                // Already has custom threshold, skip
+                continue;
+            }
+            Err(_) => {
+                // Error loading, skip
+                continue;
+            }
+        }
+
+        // Calculate optimal threshold
+        let optimal_threshold = calculate_optimal_rsi_threshold(&token.symbol, &mut redis).await;
+
+        // Only update if different from default
+        if (optimal_threshold - 45.0).abs() > 0.1 {
+            if let Err(e) = postgres
+                .update_rsi_threshold(&token.symbol, optimal_threshold)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to save RSI threshold for {}: {}",
+                    token.symbol,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "  ✓ {} - Saved optimal RSI < {:.0}",
+                    token.symbol,
+                    optimal_threshold
+                );
+            }
+        }
+    }
+}
+
+/// Calculate optimal RSI threshold for a newly discovered token
+/// Returns the best threshold based on backtest or default 45.0 if insufficient data
+async fn calculate_optimal_rsi_threshold(
+    symbol: &str,
+    redis: &mut RedisPersistence,
+) -> f64 {
+    const MIN_CANDLES_FOR_TUNING: usize = 500; // Need ~2 days of 5-min data minimum
+    const RSI_THRESHOLDS: [f64; 5] = [30.0, 35.0, 40.0, 45.0, 50.0];
+
+    // Load available candles
+    let candles = match redis.load_candles(symbol, MIN_CANDLES_FOR_TUNING as u64).await {
+        Ok(c) if c.len() >= MIN_CANDLES_FOR_TUNING => c,
+        _ => {
+            tracing::info!(
+                "  ⚙️  {} - Insufficient data for RSI tuning, using default 45.0",
+                symbol
+            );
+            return 45.0;
+        }
+    };
+
+    tracing::info!(
+        "  ⚙️  {} - Running RSI parameter sweep ({} candles)...",
+        symbol,
+        candles.len()
+    );
+
+    use cryptobot::backtest::BacktestRunner;
+    use cryptobot::risk::CircuitBreakers;
+    use cryptobot::strategy::signals::SignalConfig;
+
+    let mut best_return = f64::NEG_INFINITY;
+    let mut best_threshold = 45.0;
+
+    for &rsi_threshold in &RSI_THRESHOLDS {
+        let config = SignalConfig {
+            rsi_period: 14,
+            rsi_oversold: rsi_threshold,
+            rsi_overbought: 70.0,
+            short_ma_period: 10,
+            long_ma_period: 20,
+            volume_threshold: 1.5,
+            lookback_hours: 24,
+            enable_panic_buy: true,
+            panic_rsi_threshold: 30.0,
+            panic_volume_multiplier: 2.0,
+            panic_price_drop_pct: 8.0,
+            panic_drop_window_candles: 12,
+        };
+
+        let strategy = MomentumStrategy::new(config).with_poll_interval(5);
+        let runner = BacktestRunner::new(10000.0, CircuitBreakers::default());
+
+        if let Ok(metrics) = runner.run(&strategy, candles.clone(), symbol, 5) {
+            if metrics.total_return_pct > best_return {
+                best_return = metrics.total_return_pct;
+                best_threshold = rsi_threshold;
+            }
+        }
+    }
+
+    tracing::info!(
+        "  ✓ {} - Optimal RSI < {:.0} ({:+.2}% backtest return)",
+        symbol,
+        best_threshold,
+        best_return
+    );
+
+    best_threshold
 }
 
 // ============================================================================

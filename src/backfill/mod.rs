@@ -46,11 +46,38 @@ pub async fn backfill_token(
     stats.fetched_points = market_data.prices.len();
     tracing::debug!("Fetched {} price points", stats.fetched_points);
 
+    // Auto-detect granularity based on CoinGecko's API behavior:
+    // - 1 day: 5-minute candles
+    // - 2-90 days: hourly candles
+    // - 90+ days: daily candles (not supported yet)
+    let (converter, granularity_desc) = if days == 1 {
+        (CandleConverter::new(), "5-minute")
+    } else if days <= 90 {
+        (CandleConverter::for_hourly(), "hourly")
+    } else {
+        tracing::warn!(
+            "Backfill for {} days will use daily candles - not optimal for 5-min strategy",
+            days
+        );
+        (CandleConverter::for_hourly(), "daily (unsupported)")
+    };
+
+    tracing::info!(
+        "Converting {} price points to {} candles (days={}, granularity={})",
+        stats.fetched_points,
+        granularity_desc,
+        days,
+        granularity_desc
+    );
+
     // Convert to candles
-    let converter = CandleConverter::new();
     let candles = converter.convert_to_candles(symbol, market_data)?;
     stats.converted_candles = candles.len();
-    tracing::debug!("Converted to {} candles", stats.converted_candles);
+    tracing::debug!(
+        "Converted to {} {} candles",
+        stats.converted_candles,
+        granularity_desc
+    );
 
     // Get existing timestamps for overlap detection (if not forcing overwrite)
     let existing_timestamps = if !force_overwrite {

@@ -149,14 +149,14 @@ pub fn analyze_market_conditions(
     let current_price = prices.last()?;
 
     // Log if we're operating without volume data
-    if !has_volume_data {
-        let zero_count = volumes.iter().filter(|&&v| v <= 0.1).count();
-        tracing::warn!(
-            "⚠️  Incomplete volume data ({}/{} candles missing volume), trading without volume confirmation. \
-             This is likely CoinGecko backfilled data - volume analysis will activate after 24h of Birdeye data.",
-            zero_count, volumes.len()
-        );
-    }
+    //if !has_volume_data {
+    //    let zero_count = volumes.iter().filter(|&&v| v <= 0.1).count();
+    //    tracing::warn!(
+    //        "⚠️  Incomplete volume data ({}/{} candles missing volume), trading without volume confirmation. \
+    //         This is likely CoinGecko backfilled data - volume analysis will activate after 24h of Birdeye data.",
+    //        zero_count, volumes.len()
+    //    );
+    //}
 
     // ==================== PANIC BUY LOGIC ====================
     // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)

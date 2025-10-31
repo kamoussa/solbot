@@ -11,6 +11,21 @@ const COINGECKO_API_BASE: &str = "https://api.coingecko.com/api/v3";
 const RATE_LIMIT_RPM: u32 = 30; // Demo API: 30 requests per minute
 const MAX_RETRIES: u32 = 3;
 
+// CoinGecko OHLC Granularity by Time Range (Demo API)
+// Source: https://docs.coingecko.com/reference/coins-id-ohlc
+//
+// Time Range                 | Granularity | Candles/Day
+// ---------------------------|-------------|-------------
+// 1 day from current         | 5-minute    | 288
+// 2-90 days from current     | HOURLY      | 24
+// 90+ days from current      | DAILY       | 1
+//
+// IMPORTANT: For accurate backtesting of 5-minute strategy:
+// - Only use 1-day backfills (gets 5-min data)
+// - For longer periods, expect hourly granularity
+// - Hourly data is OK for trend analysis but NOT production-ready testing
+// - RSI/MA thresholds calibrated for 5-min will behave differently on 1-hour
+
 // Type alias for the rate limiter to simplify signatures
 type CoinGeckoRateLimiter = RateLimiter<
     governor::state::direct::NotKeyed,

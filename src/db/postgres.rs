@@ -355,6 +355,52 @@ impl PostgresPersistence {
         Ok(())
     }
 
+    /// Get RSI threshold for a token (returns default 45.0 if not found)
+    pub async fn get_rsi_threshold(&self, symbol: &str) -> Result<f64> {
+        let row = sqlx::query(
+            r#"
+            SELECT rsi_threshold
+            FROM tracked_tokens
+            WHERE symbol = $1
+            "#,
+        )
+        .bind(symbol)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let threshold: f32 = row.get("rsi_threshold");
+                Ok(threshold as f64)
+            }
+            None => {
+                // Token not found, return default
+                Ok(45.0)
+            }
+        }
+    }
+
+    /// Update RSI threshold for a token (for adaptive strategy tuning)
+    pub async fn update_rsi_threshold(&self, symbol: &str, rsi_threshold: f64) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            UPDATE tracked_tokens
+            SET rsi_threshold = $1
+            WHERE symbol = $2
+            "#,
+        )
+        .bind(rsi_threshold as f32)
+        .bind(symbol)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(format!("Token {} not found in tracked_tokens", symbol).into());
+        }
+
+        Ok(())
+    }
+
     // ==================== TOKEN ROTATION METHODS ====================
 
     /// Check if a token has any open positions (for any user)
