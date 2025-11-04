@@ -208,7 +208,7 @@ pub fn analyze_market_conditions(
     );
 
     // Check buy conditions
-    let rsi_condition = rsi < config.rsi_oversold + 10.0;
+    let rsi_condition = rsi < config.rsi_oversold;
     let ma_crossover = short_ma > long_ma;
     let price_above_ma = *current_price > short_ma;
 

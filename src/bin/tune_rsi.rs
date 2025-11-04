@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
             let strategy = MomentumStrategy::new(config).with_poll_interval(60);
             let runner = BacktestRunner::new(10000.0, CircuitBreakers::default());
 
-            match runner.run(&strategy, candles.clone(), symbol, 60) {
+            match runner.run(&strategy, candles.clone(), symbol, 60, 0.0) {
                 Ok(metrics) => {
                     println!(
                         "{:^14.1} | {:>8.2} | {:>6} | {:>7.1}% | ${:>8.2}",

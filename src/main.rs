@@ -1318,7 +1318,7 @@ async fn calculate_optimal_rsi_threshold(
         let strategy = MomentumStrategy::new(config).with_poll_interval(5);
         let runner = BacktestRunner::new(10000.0, CircuitBreakers::default());
 
-        if let Ok(metrics) = runner.run(&strategy, candles.clone(), symbol, 5) {
+        if let Ok(metrics) = runner.run(&strategy, candles.clone(), symbol, 5, 0.0) {
             if metrics.total_return_pct > best_return {
                 best_return = metrics.total_return_pct;
                 best_threshold = rsi_threshold;

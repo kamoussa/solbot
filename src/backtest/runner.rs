@@ -38,6 +38,7 @@ impl BacktestRunner {
         candles: Vec<Candle>,
         token_symbol: &str,
         poll_interval_minutes: u64,
+        transaction_cost_pct: f64,  // Round-trip cost as percentage (e.g., 0.01 = 1%)
     ) -> Result<BacktestMetrics> {
         let samples_needed = strategy.samples_needed(poll_interval_minutes);
 
@@ -177,6 +178,7 @@ impl BacktestRunner {
             self.initial_portfolio_value,
             final_portfolio_value,
             circuit_breaker_hits,
+            transaction_cost_pct,
         );
 
         tracing::info!(
@@ -196,14 +198,16 @@ impl BacktestRunner {
         candles: Vec<Candle>,
         token_symbol: &str,
         poll_interval_minutes: u64,
+        transaction_cost_pct: f64,
         scenario_name: &str,
     ) -> Result<BacktestMetrics> {
         println!("\n🔬 Running backtest: {}", scenario_name);
         println!("   Strategy: {}", strategy.name());
         println!("   Candles: {}", candles.len());
         println!("   Initial Portfolio: ${:.2}", self.initial_portfolio_value);
+        println!("   Transaction Costs: {:.2}% round-trip", transaction_cost_pct * 100.0);
 
-        let metrics = self.run(strategy, candles, token_symbol, poll_interval_minutes)?;
+        let metrics = self.run(strategy, candles, token_symbol, poll_interval_minutes, transaction_cost_pct)?;
         metrics.print_report();
 
         Ok(metrics)
@@ -230,7 +234,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH", 5);
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
@@ -264,7 +268,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH", 5);
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
@@ -282,7 +286,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH");
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -313,7 +317,7 @@ mod tests {
 
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH", 5);
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
