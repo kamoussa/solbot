@@ -83,14 +83,11 @@ async fn main() -> Result<()> {
 
         println!("  Using optimized RSI threshold: < {:.0}", rsi_threshold);
 
-        // Create momentum strategy with per-token RSI threshold
-        let mut config = cryptobot::strategy::signals::SignalConfig::default();
-        config.rsi_oversold = rsi_threshold;
-        let momentum = cryptobot::strategy::momentum::MomentumStrategy::new(config)
-            .with_poll_interval(60);
-
-        // Load candles from Redis (7 days = 2016 candles at 5-min intervals)
-        match redis.load_candles(symbol, 2016).await {
+        // Load candles from Redis (hours_back parameter)
+        // - 365 days = 8760 hours
+        // - 90 days = 2160 hours
+        // - 7 days = 168 hours
+        match redis.load_candles(symbol, 8760).await {
             Ok(candles) => {
                 if candles.is_empty() {
                     println!("⚠️  No data available for {} - skipping", symbol);
@@ -101,15 +98,25 @@ async fn main() -> Result<()> {
                 // Detect granularity from candle intervals
                 let (granularity, poll_interval) = if candles.len() > 1 {
                     let interval_secs = (candles[1].timestamp - candles[0].timestamp).num_seconds();
-                    if interval_secs >= 3000 {
-                        // >= 50 minutes (allow some variance)
+                    if interval_secs >= 43200 {
+                        // >= 12 hours → daily candles (1440 minutes)
+                        ("daily", 1440)
+                    } else if interval_secs >= 3000 {
+                        // >= 50 minutes → hourly candles (60 minutes)
                         ("hourly", 60)
                     } else {
+                        // < 50 minutes → 5-minute candles
                         ("5-minute", 5)
                     }
                 } else {
                     ("unknown", 5)
                 };
+
+                // Create momentum strategy with per-token RSI threshold and detected poll interval
+                let mut config = cryptobot::strategy::signals::SignalConfig::default();
+                config.rsi_oversold = rsi_threshold;
+                let momentum = cryptobot::strategy::momentum::MomentumStrategy::new(config)
+                    .with_poll_interval(poll_interval);
 
                 println!(
                     "✓ Loaded {} {} candles for {}",

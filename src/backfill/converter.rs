@@ -7,12 +7,14 @@ use crate::Result;
 
 const BUCKET_INTERVAL_5MIN: i64 = 300; // 5 minutes
 const BUCKET_INTERVAL_1HOUR: i64 = 3600; // 1 hour
+const BUCKET_INTERVAL_1DAY: i64 = 86400; // 1 day
 
 /// Converts irregular price points from CoinGecko to uniform OHLC candles
 ///
 /// Supports multiple granularities:
 /// - 5-minute candles (for 1-day CoinGecko data)
 /// - Hourly candles (for 2-90 day CoinGecko data)
+/// - Daily candles (for 90+ day CoinGecko data)
 pub struct CandleConverter {
     interval_secs: i64,
 }
@@ -41,6 +43,15 @@ impl CandleConverter {
     pub fn for_hourly() -> Self {
         Self {
             interval_secs: BUCKET_INTERVAL_1HOUR,
+        }
+    }
+
+    /// Create a converter for daily candles
+    ///
+    /// Use this for CoinGecko 90+ day backfills which return daily data
+    pub fn for_daily() -> Self {
+        Self {
+            interval_secs: BUCKET_INTERVAL_1DAY,
         }
     }
 

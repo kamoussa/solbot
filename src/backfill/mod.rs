@@ -49,17 +49,17 @@ pub async fn backfill_token(
     // Auto-detect granularity based on CoinGecko's API behavior:
     // - 1 day: 5-minute candles
     // - 2-90 days: hourly candles
-    // - 90+ days: daily candles (not supported yet)
+    // - 90+ days: daily candles
     let (converter, granularity_desc) = if days == 1 {
         (CandleConverter::new(), "5-minute")
     } else if days <= 90 {
         (CandleConverter::for_hourly(), "hourly")
     } else {
-        tracing::warn!(
-            "Backfill for {} days will use daily candles - not optimal for 5-min strategy",
+        tracing::info!(
+            "Backfill for {} days will use daily candles (suitable for long-term backtesting)",
             days
         );
-        (CandleConverter::for_hourly(), "daily (unsupported)")
+        (CandleConverter::for_daily(), "daily")
     };
 
     tracing::info!(

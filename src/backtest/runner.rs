@@ -82,11 +82,12 @@ impl BacktestRunner {
             // Check for exit conditions on existing positions FIRST
             {
                 let mut pm = position_manager.lock().unwrap();
-                if let Ok(closed_ids) = pm.check_exits(&prices) {
+                if let Ok(closed_ids) = pm.check_exits_at(&prices, Some(current_candle.timestamp)) {
                     if !closed_ids.is_empty() {
                         tracing::debug!(
-                            "Closed {} positions via exit conditions",
-                            closed_ids.len()
+                            "Closed {} positions via exit conditions at {}",
+                            closed_ids.len(),
+                            current_candle.timestamp
                         );
                     }
                 }
@@ -100,18 +101,20 @@ impl BacktestRunner {
                         Ok(decision) => {
                             match decision.action {
                                 ExecutionAction::Execute { quantity } => {
-                                    // Open position
+                                    // Open position with candle timestamp for accurate backtesting
                                     let mut pm = position_manager.lock().unwrap();
-                                    match pm.open_position(
+                                    match pm.open_position_at(
                                         token_symbol.to_string(),
                                         current_price,
                                         quantity,
+                                        Some(current_candle.timestamp),
                                     ) {
                                         Ok(_) => {
                                             tracing::debug!(
-                                                "Opened position @ ${:.4} qty: {:.4}",
+                                                "Opened position @ ${:.4} qty: {:.4} at {}",
                                                 current_price,
-                                                quantity
+                                                quantity,
+                                                current_candle.timestamp
                                             );
                                         }
                                         Err(e) => {
@@ -126,10 +129,14 @@ impl BacktestRunner {
                                     position_id,
                                     exit_reason,
                                 } => {
-                                    // Close position
+                                    // Close position with candle timestamp for accurate backtesting
                                     let mut pm = position_manager.lock().unwrap();
-                                    let _ =
-                                        pm.close_position(position_id, current_price, exit_reason);
+                                    let _ = pm.close_position_at(
+                                        position_id,
+                                        current_price,
+                                        exit_reason,
+                                        Some(current_candle.timestamp),
+                                    );
                                 }
                                 ExecutionAction::Skip => {
                                     // Do nothing
