@@ -378,7 +378,14 @@ async fn discover_and_build_token_list(
 
     // Discover new trending tokens
     tracing::info!("🔍 Discovering tokens from Birdeye...");
-    let trending_tokens = birdeye_client.get_trending("rank", "asc", 0, 20).await?;
+
+    let trending_tokens = match birdeye_client.get_trending("rank", "asc", 0, 20).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::error!("  ✗ Discovery failed: {}", e);
+            Vec::<TrendingToken>::new()
+        }
+    };
     tracing::info!("Found {} trending tokens", trending_tokens.len());
 
     // Apply safety filter
@@ -922,7 +929,7 @@ async fn token_discovery_loop(
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
-    // Start immediately, then run every 4 hours 
+    // Start immediately, then run every 4 hours
     let mut ticker = interval_at(Instant::now(), Duration::from_secs(14400));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
