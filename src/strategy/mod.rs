@@ -1,5 +1,6 @@
 // Trading strategy module
 pub mod buy_and_hold;
+pub mod mean_reversion;
 pub mod momentum;
 pub mod signals;
 

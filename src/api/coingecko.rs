@@ -280,6 +280,56 @@ impl CoinGeckoClient {
 
         Ok(data)
     }
+
+    /// Fetch market chart data for a specific date range
+    ///
+    /// # Arguments
+    /// * `coin_id` - CoinGecko coin ID (e.g., "solana")
+    /// * `from_timestamp` - Unix timestamp (seconds) for start date
+    /// * `to_timestamp` - Unix timestamp (seconds) for end date
+    ///
+    /// # Returns
+    /// MarketChartData with hourly granularity (for ranges within past 365 days)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let now = chrono::Utc::now().timestamp();
+    /// let days_90_ago = now - (90 * 24 * 60 * 60);
+    /// let data = client.get_market_chart_range("solana", days_90_ago, now).await?;
+    /// ```
+    pub async fn get_market_chart_range(
+        &self,
+        coin_id: &str,
+        from_timestamp: i64,
+        to_timestamp: i64,
+    ) -> Result<MarketChartData> {
+        let url = format!(
+            "{}/coins/{}/market_chart/range?vs_currency=usd&from={}&to={}&x_cg_demo_api_key={}",
+            COINGECKO_API_BASE, coin_id, from_timestamp, to_timestamp, self.api_key
+        );
+
+        tracing::debug!(
+            "Fetching market chart range for {} ({} to {})",
+            coin_id,
+            from_timestamp,
+            to_timestamp
+        );
+
+        let response = self.make_request(&url).await?;
+
+        let data: MarketChartData = response
+            .json()
+            .await
+            .context("Failed to parse market chart range")?;
+
+        tracing::debug!(
+            "Fetched {} price points for {} (range query)",
+            data.prices.len(),
+            coin_id
+        );
+
+        Ok(data)
+    }
 }
 
 #[cfg(test)]

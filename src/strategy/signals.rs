@@ -129,6 +129,13 @@ pub fn analyze_market_conditions(
     let short_ma = calculate_sma(prices, config.short_ma_period)?;
     let long_ma = calculate_sma(prices, config.long_ma_period)?;
 
+    // Calculate previous RSI to detect crossover (RSI crossing above threshold)
+    let prev_rsi = if prices.len() > 1 {
+        calculate_rsi(&prices[..prices.len() - 1], config.rsi_period)
+    } else {
+        None
+    };
+
     // Calculate volume conditions
     let current_volume = volumes.last()?;
 
@@ -208,20 +215,34 @@ pub fn analyze_market_conditions(
     );
 
     // Check buy conditions
-    let rsi_condition = rsi < config.rsi_oversold;
+    // FIXED: Changed from "RSI < threshold" to "RSI crosses ABOVE threshold"
+    // This waits for momentum to shift back up instead of catching falling knife
+    let rsi_condition = if let Some(prev) = prev_rsi {
+        prev < config.rsi_oversold && rsi >= config.rsi_oversold
+    } else {
+        // Fallback if no previous RSI: just check if RSI is near threshold
+        rsi >= config.rsi_oversold && rsi < config.rsi_oversold + 5.0
+    };
     let ma_crossover = short_ma > long_ma;
     let price_above_ma = *current_price > short_ma;
 
-    // Without volume data, require all 3 other conditions (more conservative)
-    // With volume data, require 3 out of 4 conditions (allows flexibility)
+    // CORE + FLEXIBLE conditions to prevent "buying the peak":
+    // CORE (always required): RSI crossover + MA uptrend
+    //   - Ensures entry from oversold reversal (not chasing pumps)
+    //   - Ensures alignment with uptrend
+    // FLEXIBLE (need 1 of 2): Price > MA OR Volume spike
+    //   - Provides confirmation of momentum
     let (buy_signal, buy_reason) = if has_volume_data {
-        let buy_conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
-        let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+        let core_met = rsi_condition && ma_crossover;
+        let flexible_met = price_above_ma || volume_spike;
+        let buy_signal = core_met && flexible_met;
+
         (
-            buy_count >= 3,
+            buy_signal,
             format!(
-                "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
-                rsi_condition, ma_crossover, price_above_ma, volume_spike, buy_count
+                "BUY conditions: CORE[RSI↑={} && MA↑={}] + FLEX[Price>MA={} || Vol↑={}] = {}",
+                rsi_condition, ma_crossover, price_above_ma, volume_spike,
+                if buy_signal { "✓ BUY" } else { "✗ HOLD" }
             ),
         )
     } else {
@@ -232,7 +253,7 @@ pub fn analyze_market_conditions(
         (
             all_met,
             format!(
-                "BUY conditions (NO VOLUME): RSI<40={}, MA↑={}, Price>MA={} ({}/3 met, all required)",
+                "BUY conditions (NO VOLUME): RSI↑threshold={}, MA↑={}, Price>MA={} ({}/3 met, all required)",
                 rsi_condition, ma_crossover, price_above_ma, buy_count
             ),
         )

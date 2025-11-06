@@ -2,6 +2,7 @@ use cryptobot::backtest::BacktestRunner;
 use cryptobot::persistence::RedisPersistence;
 use cryptobot::risk::CircuitBreakers;
 use cryptobot::strategy::buy_and_hold::BuyAndHoldStrategy;
+use cryptobot::strategy::mean_reversion::MeanReversionStrategy;
 use cryptobot::Result;
 
 #[tokio::main]
@@ -54,20 +55,20 @@ async fn main() -> Result<()> {
     // 15) "snapshots:TRUMP"
     let tokens = vec![
         ("SOL", "Solana"),
-        ("JUP", "Jupiter"),
-        ("Bonk", "Bonk"),
-        ("TRUMP", "Trump"),
-        ("USELESS", "USELESS"),
-        ("PUMP", "PUMP"),
-        ("WBTC", "WBTC"),
-        ("URANUS", "URANUS"),
-        ("PENGU", "PENGU"),
-        ("WETH", "WETH"),
-        ("BOT", "BOT"),
-        ("SPX", "SPX"),
-        ("RAY", "RAY"),
-        ("TROLL", "TROLL"),
-        ("KMNO", "KMNO"),
+        //("JUP", "Jupiter"),
+        //("Bonk", "Bonk"),
+        //("TRUMP", "Trump"),
+        //("USELESS", "USELESS"),
+        //("PUMP", "PUMP"),
+        //("WBTC", "WBTC"),
+        //("URANUS", "URANUS"),
+        //("PENGU", "PENGU"),
+        //("WETH", "WETH"),
+        //("BOT", "BOT"),
+        //("SPX", "SPX"),
+        //("RAY", "RAY"),
+        //("TROLL", "TROLL"),
+        //("KMNO", "KMNO"),
     ];
 
     let mut all_results: Vec<(String, String, cryptobot::backtest::BacktestMetrics)> = Vec::new();
@@ -83,11 +84,9 @@ async fn main() -> Result<()> {
 
         println!("  Using optimized RSI threshold: < {:.0}", rsi_threshold);
 
-        // Load candles from Redis (hours_back parameter)
-        // - 365 days = 8760 hours
-        // - 90 days = 2160 hours
-        // - 7 days = 168 hours
-        match redis.load_candles(symbol, 8760).await {
+        // Load ALL candles from Redis (for historical backtesting)
+        // This loads all historical data (e.g., from CSV imports) without time filtering
+        match redis.load_all_candles(symbol).await {
             Ok(candles) => {
                 if candles.is_empty() {
                     println!("⚠️  No data available for {} - skipping", symbol);
@@ -116,6 +115,10 @@ async fn main() -> Result<()> {
                 let mut config = cryptobot::strategy::signals::SignalConfig::default();
                 config.rsi_oversold = rsi_threshold;
                 let momentum = cryptobot::strategy::momentum::MomentumStrategy::new(config)
+                    .with_poll_interval(poll_interval);
+
+                // Create mean reversion strategy with detected poll interval
+                let mean_reversion = MeanReversionStrategy::default()
                     .with_poll_interval(poll_interval);
 
                 println!(
@@ -185,6 +188,33 @@ async fn main() -> Result<()> {
                                 all_results.push((
                                     name.to_string(),
                                     format!("Momentum ({})", cost_label),
+                                    metrics.clone(),
+                                ));
+                                println!(
+                                    "     Gross: {:+.2}% | Net: {:+.2}% | Costs: ${:.2} ({} trades)",
+                                    metrics.total_return_pct,
+                                    metrics.net_return_pct,
+                                    metrics.total_transaction_costs,
+                                    metrics.total_trades
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("     ❌ Failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // Test Mean Reversion strategy
+                    {
+                        let runner =
+                            BacktestRunner::new(initial_portfolio_value, circuit_breakers.clone());
+                        println!("\n  🔬 Testing Mean Reversion strategy [{}]...", cost_label);
+
+                        match runner.run(&mean_reversion, candles.clone(), symbol, poll_interval, *cost_pct) {
+                            Ok(metrics) => {
+                                all_results.push((
+                                    name.to_string(),
+                                    format!("Mean Reversion ({})", cost_label),
                                     metrics.clone(),
                                 ));
                                 println!(

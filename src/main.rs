@@ -58,6 +58,14 @@ enum Commands {
         /// Force overwrite existing data
         #[arg(short, long)]
         force: bool,
+
+        /// Use range API for chunked backfill (better for 90+ days)
+        #[arg(long)]
+        chunked: bool,
+
+        /// Chunk size in days when using chunked mode (default: 90)
+        #[arg(long, default_value = "90")]
+        chunk_size: u32,
     },
 }
 
@@ -109,7 +117,9 @@ async fn main() -> Result<()> {
             address,
             days,
             force,
-        }) => run_backfill(&symbol, &address, days, force).await,
+            chunked,
+            chunk_size,
+        }) => run_backfill(&symbol, &address, days, force, chunked, chunk_size).await,
         None => run_bot().await,
     }
 }
@@ -268,7 +278,7 @@ async fn connect_to_postgres() -> Option<PostgresPersistence> {
     }
 }
 
-async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Result<()> {
+async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool, chunked: bool, chunk_size: u32) -> Result<()> {
     tracing::info!(
         "📥 Backfill Mode: {} ({}) for {} days",
         symbol,
@@ -277,6 +287,9 @@ async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Re
     );
     if force {
         tracing::info!("  Force mode: will overwrite existing data");
+    }
+    if chunked {
+        tracing::info!("  Chunked mode: using {}-day chunks with range API", chunk_size);
     }
 
     // Get required environment variables
@@ -293,20 +306,163 @@ async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Re
     tracing::info!("🔄 Connecting to Redis at {}...", redis_url);
     let mut redis = RedisPersistence::new(&redis_url).await?;
 
-    // Run backfill
-    let stats = backfill_token(symbol, address, days, force, &coingecko, &mut redis).await?;
+    if chunked {
+        // Chunked backfill using range API
+        run_chunked_backfill(symbol, address, days, chunk_size, force, &coingecko, &mut redis).await
+    } else {
+        // Standard backfill
+        let stats = backfill_token(symbol, address, days, force, &coingecko, &mut redis).await?;
 
-    // Print results
-    tracing::info!("\n📊 Backfill Results:");
-    tracing::info!("  Fetched data points: {}", stats.fetched_points);
-    tracing::info!("  Converted candles: {}", stats.converted_candles);
-    tracing::info!("  Skipped existing: {}", stats.skipped_existing);
-    tracing::info!("  Stored new: {}", stats.stored_new);
-    tracing::info!("  Validation failures: {}", stats.validation_failures);
+        // Print results
+        tracing::info!("\n📊 Backfill Results:");
+        tracing::info!("  Fetched data points: {}", stats.fetched_points);
+        tracing::info!("  Converted candles: {}", stats.converted_candles);
+        tracing::info!("  Skipped existing: {}", stats.skipped_existing);
+        tracing::info!("  Stored new: {}", stats.stored_new);
+        tracing::info!("  Validation failures: {}", stats.validation_failures);
 
-    if stats.stored_new > 0 {
-        tracing::info!("\n✅ Backfill complete!");
-    } else if stats.skipped_existing > 0 {
+        if stats.stored_new > 0 {
+            tracing::info!("\n✅ Backfill complete!");
+        } else if stats.skipped_existing > 0 {
+            tracing::info!("\n✅ All data already present, nothing to backfill");
+        } else {
+            tracing::warn!("\n⚠️  No data was stored");
+        }
+
+        Ok(())
+    }
+}
+
+async fn run_chunked_backfill(
+    symbol: &str,
+    address: &str,
+    total_days: u32,
+    chunk_size: u32,
+    force: bool,
+    coingecko: &CoinGeckoClient,
+    redis: &mut RedisPersistence,
+) -> Result<()> {
+    use chrono::Utc;
+
+    tracing::info!("\n🔄 Starting chunked backfill for {} ({} days in {}-day chunks)...", symbol, total_days, chunk_size);
+
+    // Find CoinGecko coin_id
+    let coin_id = coingecko.find_coin_id(symbol, address).await?;
+    tracing::info!("  Found coin_id: {}", coin_id);
+
+    // Calculate chunks (working backwards from now)
+    let now = Utc::now().timestamp();
+    let mut chunks = Vec::new();
+    let mut remaining_days = total_days;
+    let mut current_end = now;
+
+    while remaining_days > 0 {
+        let chunk_days = remaining_days.min(chunk_size);
+        let chunk_start = current_end - (chunk_days as i64 * 24 * 60 * 60);
+        chunks.push((chunk_start, current_end, chunk_days));
+        current_end = chunk_start;
+        remaining_days = remaining_days.saturating_sub(chunk_size);
+    }
+
+    chunks.reverse(); // Process oldest to newest
+
+    tracing::info!("  Split into {} chunks", chunks.len());
+
+    let mut total_stats = cryptobot::backfill::BackfillStats {
+        fetched_points: 0,
+        converted_candles: 0,
+        skipped_existing: 0,
+        stored_new: 0,
+        validation_failures: 0,
+    };
+
+    for (i, (from_ts, to_ts, chunk_days)) in chunks.iter().enumerate() {
+        tracing::info!("\n  📦 Chunk {}/{}: {} days (from {} to {})",
+            i + 1, chunks.len(), chunk_days,
+            chrono::DateTime::from_timestamp(*from_ts, 0).unwrap().format("%Y-%m-%d"),
+            chrono::DateTime::from_timestamp(*to_ts, 0).unwrap().format("%Y-%m-%d")
+        );
+
+        // Fetch data for this chunk using range API
+        let market_data = coingecko.get_market_chart_range(&coin_id, *from_ts, *to_ts).await?;
+        let fetched_count = market_data.prices.len();
+        tracing::info!("    Fetched {} price points", fetched_count);
+
+        // Convert to candles (hourly for ranges within 365 days)
+        let converter = cryptobot::backfill::CandleConverter::for_hourly();
+        let candles = converter.convert_to_candles(symbol, market_data)?;
+        tracing::info!("    Converted to {} hourly candles", candles.len());
+
+        // Get existing timestamps for overlap detection
+        let existing_timestamps = if !force {
+            redis.load_candles(symbol, *chunk_days as u64 * 24)
+                .await?
+                .into_iter()
+                .map(|c| c.timestamp)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Validate and filter candles
+        let validator = cryptobot::backfill::CandleValidator::new();
+        let mut candles_to_store = Vec::new();
+        let mut chunk_skipped = 0;
+        let mut chunk_failed = 0;
+
+        for candle in candles {
+            // Validate
+            if let Err(e) = validator.validate(&candle) {
+                tracing::warn!("Validation failed for candle at {}: {}", candle.timestamp, e);
+                chunk_failed += 1;
+                continue;
+            }
+
+            // Check for overlap
+            if !force {
+                let is_duplicate = existing_timestamps
+                    .iter()
+                    .any(|&ts| (candle.timestamp - ts).num_seconds().abs() < 60);
+
+                if is_duplicate {
+                    chunk_skipped += 1;
+                    continue;
+                }
+            }
+
+            candles_to_store.push(candle);
+        }
+
+        // Store candles
+        let chunk_stored = if !candles_to_store.is_empty() {
+            redis.save_candles(symbol, &candles_to_store).await?;
+            candles_to_store.len()
+        } else {
+            0
+        };
+
+        tracing::info!("    ✓ Stored {} new candles (skipped {}, failed validation {})",
+            chunk_stored, chunk_skipped, chunk_failed);
+
+        // Aggregate stats
+        total_stats.fetched_points += fetched_count;
+        total_stats.converted_candles += candles_to_store.len() + chunk_skipped + chunk_failed;
+        total_stats.skipped_existing += chunk_skipped;
+        total_stats.stored_new += chunk_stored;
+        total_stats.validation_failures += chunk_failed;
+    }
+
+    // Print final results
+    tracing::info!("\n📊 Total Backfill Results:");
+    tracing::info!("  Fetched data points: {}", total_stats.fetched_points);
+    tracing::info!("  Converted candles: {}", total_stats.converted_candles);
+    tracing::info!("  Skipped existing: {}", total_stats.skipped_existing);
+    tracing::info!("  Stored new: {}", total_stats.stored_new);
+    tracing::info!("  Validation failures: {}", total_stats.validation_failures);
+
+    if total_stats.stored_new > 0 {
+        tracing::info!("\n✅ Chunked backfill complete!");
+    } else if total_stats.skipped_existing > 0 {
         tracing::info!("\n✅ All data already present, nothing to backfill");
     } else {
         tracing::warn!("\n⚠️  No data was stored");
