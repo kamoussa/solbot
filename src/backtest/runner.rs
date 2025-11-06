@@ -28,6 +28,7 @@ impl BacktestRunner {
     /// * `strategy` - The trading strategy to test
     /// * `candles` - Historical candle data (must be sufficient for strategy lookback)
     /// * `token_symbol` - Token symbol for the candles
+    /// * `poll_interval_minutes` - The actual polling interval of the candle data
     ///
     /// # Returns
     /// BacktestMetrics with performance data
@@ -36,8 +37,10 @@ impl BacktestRunner {
         strategy: &S,
         candles: Vec<Candle>,
         token_symbol: &str,
+        poll_interval_minutes: u64,
+        transaction_cost_pct: f64,  // Round-trip cost as percentage (e.g., 0.01 = 1%)
     ) -> Result<BacktestMetrics> {
-        let samples_needed = strategy.samples_needed(5); // Assume 5 min intervals
+        let samples_needed = strategy.samples_needed(poll_interval_minutes);
 
         if candles.len() < samples_needed {
             return Err(format!(
@@ -79,11 +82,12 @@ impl BacktestRunner {
             // Check for exit conditions on existing positions FIRST
             {
                 let mut pm = position_manager.lock().unwrap();
-                if let Ok(closed_ids) = pm.check_exits(&prices) {
+                if let Ok(closed_ids) = pm.check_exits_at(&prices, Some(current_candle.timestamp)) {
                     if !closed_ids.is_empty() {
                         tracing::debug!(
-                            "Closed {} positions via exit conditions",
-                            closed_ids.len()
+                            "Closed {} positions via exit conditions at {}",
+                            closed_ids.len(),
+                            current_candle.timestamp
                         );
                     }
                 }
@@ -97,18 +101,20 @@ impl BacktestRunner {
                         Ok(decision) => {
                             match decision.action {
                                 ExecutionAction::Execute { quantity } => {
-                                    // Open position
+                                    // Open position with candle timestamp for accurate backtesting
                                     let mut pm = position_manager.lock().unwrap();
-                                    match pm.open_position(
+                                    match pm.open_position_at(
                                         token_symbol.to_string(),
                                         current_price,
                                         quantity,
+                                        Some(current_candle.timestamp),
                                     ) {
                                         Ok(_) => {
                                             tracing::debug!(
-                                                "Opened position @ ${:.4} qty: {:.4}",
+                                                "Opened position @ ${:.4} qty: {:.4} at {}",
                                                 current_price,
-                                                quantity
+                                                quantity,
+                                                current_candle.timestamp
                                             );
                                         }
                                         Err(e) => {
@@ -123,10 +129,14 @@ impl BacktestRunner {
                                     position_id,
                                     exit_reason,
                                 } => {
-                                    // Close position
+                                    // Close position with candle timestamp for accurate backtesting
                                     let mut pm = position_manager.lock().unwrap();
-                                    let _ =
-                                        pm.close_position(position_id, current_price, exit_reason);
+                                    let _ = pm.close_position_at(
+                                        position_id,
+                                        current_price,
+                                        exit_reason,
+                                        Some(current_candle.timestamp),
+                                    );
                                 }
                                 ExecutionAction::Skip => {
                                     // Do nothing
@@ -175,6 +185,7 @@ impl BacktestRunner {
             self.initial_portfolio_value,
             final_portfolio_value,
             circuit_breaker_hits,
+            transaction_cost_pct,
         );
 
         tracing::info!(
@@ -193,14 +204,17 @@ impl BacktestRunner {
         strategy: &S,
         candles: Vec<Candle>,
         token_symbol: &str,
+        poll_interval_minutes: u64,
+        transaction_cost_pct: f64,
         scenario_name: &str,
     ) -> Result<BacktestMetrics> {
         println!("\n🔬 Running backtest: {}", scenario_name);
         println!("   Strategy: {}", strategy.name());
         println!("   Candles: {}", candles.len());
         println!("   Initial Portfolio: ${:.2}", self.initial_portfolio_value);
+        println!("   Transaction Costs: {:.2}% round-trip", transaction_cost_pct * 100.0);
 
-        let metrics = self.run(strategy, candles, token_symbol)?;
+        let metrics = self.run(strategy, candles, token_symbol, poll_interval_minutes, transaction_cost_pct)?;
         metrics.print_report();
 
         Ok(metrics)
@@ -227,7 +241,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH");
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
@@ -261,7 +275,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH");
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();
@@ -279,7 +293,7 @@ mod tests {
         let circuit_breakers = CircuitBreakers::default();
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH");
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -310,7 +324,7 @@ mod tests {
 
         let runner = BacktestRunner::new(10000.0, circuit_breakers);
 
-        let result = runner.run(&strategy, candles, "SYNTH");
+        let result = runner.run(&strategy, candles, "SYNTH", 5, 0.0);
         assert!(result.is_ok());
 
         let metrics = result.unwrap();

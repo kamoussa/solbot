@@ -13,10 +13,12 @@ pub struct TradeRecord {
     pub pnl: f64,
     pub pnl_pct: f64,
     pub holding_period_minutes: i64,
+    pub transaction_cost: f64,  // Total fees for this trade (entry + exit)
+    pub net_pnl: f64,            // P&L after transaction costs
 }
 
 impl TradeRecord {
-    pub fn from_position(position: &Position) -> Option<Self> {
+    pub fn from_position(position: &Position, transaction_cost: f64) -> Option<Self> {
         if let (Some(exit_price), Some(exit_time), Some(realized_pnl)) = (
             position.exit_price,
             position.exit_time,
@@ -24,6 +26,7 @@ impl TradeRecord {
         ) {
             let holding_period = (exit_time - position.entry_time).num_minutes();
             let pnl_pct = ((exit_price - position.entry_price) / position.entry_price) * 100.0;
+            let net_pnl = realized_pnl - transaction_cost;
 
             Some(Self {
                 entry_time: position.entry_time,
@@ -34,6 +37,8 @@ impl TradeRecord {
                 pnl: realized_pnl,
                 pnl_pct,
                 holding_period_minutes: holding_period,
+                transaction_cost,
+                net_pnl,
             })
         } else {
             None
@@ -73,6 +78,11 @@ pub struct BacktestMetrics {
     pub max_holding_period_minutes: i64,
     pub min_holding_period_minutes: i64,
 
+    // Transaction Costs
+    pub total_transaction_costs: f64,
+    pub net_pnl: f64,  // total_pnl - total_transaction_costs
+    pub net_return_pct: f64,
+
     // Circuit Breakers
     pub circuit_breaker_hits: usize,
 
@@ -87,10 +97,21 @@ impl BacktestMetrics {
         initial_portfolio_value: f64,
         final_portfolio_value: f64,
         circuit_breaker_hits: usize,
+        transaction_cost_pct: f64,  // Round-trip cost as percentage (e.g., 0.01 = 1%)
     ) -> Self {
         let trades: Vec<TradeRecord> = positions
             .iter()
-            .filter_map(TradeRecord::from_position)
+            .filter_map(|pos| {
+                // Calculate transaction cost for this trade (entry + exit)
+                let cost = if let Some(exit_price) = pos.exit_price {
+                    let entry_cost = pos.entry_price * pos.quantity * (transaction_cost_pct / 2.0);
+                    let exit_cost = exit_price * pos.quantity * (transaction_cost_pct / 2.0);
+                    entry_cost + exit_cost
+                } else {
+                    0.0
+                };
+                TradeRecord::from_position(pos, cost)
+            })
             .collect();
 
         let total_trades = trades.len();
@@ -176,6 +197,12 @@ impl BacktestMetrics {
         let max_holding_period_minutes = *holding_periods.iter().max().unwrap_or(&0);
         let min_holding_period_minutes = *holding_periods.iter().min().unwrap_or(&0);
 
+        // Transaction costs
+        let total_transaction_costs: f64 = trades.iter().map(|t| t.transaction_cost).sum();
+        let net_pnl = total_pnl - total_transaction_costs;
+        let net_return_pct =
+            ((final_portfolio_value - total_transaction_costs - initial_portfolio_value) / initial_portfolio_value) * 100.0;
+
         Self {
             total_pnl,
             total_return_pct,
@@ -196,6 +223,9 @@ impl BacktestMetrics {
             avg_holding_period_minutes,
             max_holding_period_minutes,
             min_holding_period_minutes,
+            total_transaction_costs,
+            net_pnl,
+            net_return_pct,
             circuit_breaker_hits,
             trades,
         }
@@ -227,6 +257,9 @@ impl BacktestMetrics {
             avg_holding_period_minutes: 0.0,
             max_holding_period_minutes: 0,
             min_holding_period_minutes: 0,
+            total_transaction_costs: 0.0,
+            net_pnl: 0.0,
+            net_return_pct: 0.0,
             circuit_breaker_hits,
             trades: vec![],
         }
@@ -306,8 +339,16 @@ impl BacktestMetrics {
             self.final_portfolio_value
         );
         println!(
-            "  Total P&L:             ${:.2} ({:+.2}%)",
+            "  Gross P&L:             ${:.2} ({:+.2}%)",
             self.total_pnl, self.total_return_pct
+        );
+        println!(
+            "  Transaction Costs:     ${:.2}",
+            self.total_transaction_costs
+        );
+        println!(
+            "  Net P&L:               ${:.2} ({:+.2}%)",
+            self.net_pnl, self.net_return_pct
         );
 
         println!("\n📈 TRADE STATISTICS");
@@ -399,7 +440,7 @@ mod tests {
             create_test_position(-30.0, 90), // $30 loss
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10120.0, 0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10120.0, 0, 0.0);
 
         assert_eq!(metrics.total_trades, 3);
         assert_eq!(metrics.winning_trades, 2);
@@ -411,7 +452,7 @@ mod tests {
     #[test]
     fn test_metrics_with_no_trades() {
         let positions = vec![];
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10000.0, 0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10000.0, 0, 0.0);
 
         assert_eq!(metrics.total_trades, 0);
         assert_eq!(metrics.win_rate, 0.0);
@@ -426,7 +467,7 @@ mod tests {
             create_test_position(-50.0, 60), // $50 loss
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10250.0, 0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10250.0, 0, 0.0);
 
         // Profit factor = Total wins / Total losses = 300 / 50 = 6.0
         assert!((metrics.profit_factor - 6.0).abs() < 0.01);
@@ -440,7 +481,7 @@ mod tests {
             create_test_position(50.0, 60),   // Back to 9950
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 9950.0, 0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 9950.0, 0, 0.0);
 
         assert!((metrics.max_drawdown - 200.0).abs() < 0.01);
     }

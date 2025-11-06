@@ -11,6 +11,21 @@ const COINGECKO_API_BASE: &str = "https://api.coingecko.com/api/v3";
 const RATE_LIMIT_RPM: u32 = 30; // Demo API: 30 requests per minute
 const MAX_RETRIES: u32 = 3;
 
+// CoinGecko OHLC Granularity by Time Range (Demo API)
+// Source: https://docs.coingecko.com/reference/coins-id-ohlc
+//
+// Time Range                 | Granularity | Candles/Day
+// ---------------------------|-------------|-------------
+// 1 day from current         | 5-minute    | 288
+// 2-90 days from current     | HOURLY      | 24
+// 90+ days from current      | DAILY       | 1
+//
+// IMPORTANT: For accurate backtesting of 5-minute strategy:
+// - Only use 1-day backfills (gets 5-min data)
+// - For longer periods, expect hourly granularity
+// - Hourly data is OK for trend analysis but NOT production-ready testing
+// - RSI/MA thresholds calibrated for 5-min will behave differently on 1-hour
+
 // Type alias for the rate limiter to simplify signatures
 type CoinGeckoRateLimiter = RateLimiter<
     governor::state::direct::NotKeyed,
@@ -262,6 +277,56 @@ impl CoinGeckoClient {
             .context("Failed to parse market chart")?;
 
         tracing::debug!("Fetched {} price points for {}", data.prices.len(), coin_id);
+
+        Ok(data)
+    }
+
+    /// Fetch market chart data for a specific date range
+    ///
+    /// # Arguments
+    /// * `coin_id` - CoinGecko coin ID (e.g., "solana")
+    /// * `from_timestamp` - Unix timestamp (seconds) for start date
+    /// * `to_timestamp` - Unix timestamp (seconds) for end date
+    ///
+    /// # Returns
+    /// MarketChartData with hourly granularity (for ranges within past 365 days)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let now = chrono::Utc::now().timestamp();
+    /// let days_90_ago = now - (90 * 24 * 60 * 60);
+    /// let data = client.get_market_chart_range("solana", days_90_ago, now).await?;
+    /// ```
+    pub async fn get_market_chart_range(
+        &self,
+        coin_id: &str,
+        from_timestamp: i64,
+        to_timestamp: i64,
+    ) -> Result<MarketChartData> {
+        let url = format!(
+            "{}/coins/{}/market_chart/range?vs_currency=usd&from={}&to={}&x_cg_demo_api_key={}",
+            COINGECKO_API_BASE, coin_id, from_timestamp, to_timestamp, self.api_key
+        );
+
+        tracing::debug!(
+            "Fetching market chart range for {} ({} to {})",
+            coin_id,
+            from_timestamp,
+            to_timestamp
+        );
+
+        let response = self.make_request(&url).await?;
+
+        let data: MarketChartData = response
+            .json()
+            .await
+            .context("Failed to parse market chart range")?;
+
+        tracing::debug!(
+            "Fetched {} price points for {} (range query)",
+            data.prices.len(),
+            coin_id
+        );
 
         Ok(data)
     }
