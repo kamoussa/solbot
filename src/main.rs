@@ -200,7 +200,7 @@ async fn run_bot() -> Result<()> {
         })
     };
 
-    // Spawn Loop 3: Token Discovery (every 30 minutes)
+    // Spawn Loop 3: Token Discovery (every 4 hours)
     let discovery_task = {
         let tokens = shared_state.tokens.clone();
         let birdeye_key = birdeye_api_key.clone();
@@ -213,7 +213,7 @@ async fn run_bot() -> Result<()> {
     tracing::info!("✅ All loops spawned successfully");
     tracing::info!("  🔄 Price Fetch: every 5 min (clock-aligned to XX:00, XX:05, etc.)");
     tracing::info!("  💹 Trading: every 5 min (30 sec after price fetch)");
-    tracing::info!("  🔍 Discovery: every 30 min");
+    tracing::info!("  🔍 Discovery: every 4 hours");
     tracing::info!("\nPress Ctrl+C to stop...\n");
 
     // Wait for Ctrl+C or task failure
@@ -889,7 +889,7 @@ async fn trading_execution_loop(
     }
 }
 
-/// Loop 3: Token Discovery Loop (every 30 minutes)
+/// Loop 3: Token Discovery Loop (every 4 hours)
 /// Discovers trending tokens and updates the token list
 async fn token_discovery_loop(
     tokens: Arc<RwLock<Vec<Token>>>,
@@ -922,8 +922,8 @@ async fn token_discovery_loop(
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
-    // Start immediately, then run every 30 minutes
-    let mut ticker = interval_at(Instant::now(), Duration::from_secs(1800));
+    // Start immediately, then run every 4 hours 
+    let mut ticker = interval_at(Instant::now(), Duration::from_secs(14400));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {

@@ -172,7 +172,9 @@ impl BirdeyeClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(format!("Birdeye API error: {}", response.status()).into());
+            let status = response.status();
+            let body = response.text().await?;
+            return Err(format!("Birdeye API error: {} {}", status, body).into());
         }
 
         let data: BirdeyeResponse<TrendingData> = response.json().await?;
