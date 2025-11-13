@@ -8,7 +8,7 @@
 use cryptobot::backtest::BacktestRunner;
 use cryptobot::models::{Candle, Signal};
 use cryptobot::persistence::RedisPersistence;
-use cryptobot::regime::{CompositeRegimeDetector, MarketRegime, RegimeDetector};
+use cryptobot::regime::{CompositeRegimeDetector, LLMRegimeDetector, LLMStrategySelector, MarketRegime, RegimeDetector, Strategy as StrategyEnum};
 use cryptobot::risk::CircuitBreakers;
 use cryptobot::strategy::buy_and_hold::BuyAndHoldStrategy;
 use cryptobot::strategy::mean_reversion::MeanReversionStrategy;
@@ -241,6 +241,534 @@ impl Strategy for ConfidenceHybridStrategy {
     }
 }
 
+/// LLM-based Hybrid Strategy with sampling
+///
+/// Uses GPT-4 to detect regime with high accuracy, but samples every N hours
+/// to reduce API costs ($0.0085 per call).
+///
+/// Sampling strategy:
+/// Anti-Thrashing Regime Tracker
+///
+/// Prevents rapid regime switching by enforcing:
+/// - Minimum regime duration (must stay in regime for N samples)
+/// - Confidence thresholds (must be X% confident to switch)
+/// - Extra protection for trends (they persist longer than choppy markets)
+struct RegimeTracker {
+    current_regime: Option<MarketRegime>,
+    regime_start_sample: usize,  // Sample number when current regime started
+    min_duration_samples: usize,  // Don't switch for at least N samples
+    default_confidence_threshold: f64,  // Require high confidence to switch (0.85 = 85%)
+    trend_confidence_threshold: f64,    // Even higher for exiting trends (0.90 = 90%)
+    switches_count: usize,  // Track total switches for debugging
+}
+
+impl RegimeTracker {
+    fn new() -> Self {
+        Self {
+            current_regime: None,
+            regime_start_sample: 0,
+            min_duration_samples: 4,  // 4 samples × 48h = 192 hours (8 days) minimum
+            default_confidence_threshold: 0.85,  // 85% confidence required
+            trend_confidence_threshold: 0.90,     // 90% for trends
+            switches_count: 0,
+        }
+    }
+
+    /// Filter LLM's regime decision through anti-thrashing rules
+    fn should_accept_regime(
+        &mut self,
+        llm_regime: MarketRegime,
+        llm_confidence: f64,
+        current_sample: usize
+    ) -> MarketRegime {
+        // First detection - accept it
+        if self.current_regime.is_none() {
+            self.current_regime = Some(llm_regime);
+            self.regime_start_sample = current_sample;
+            println!("  🎯 REGIME TRACKER: Initial regime {:?} (confidence: {:.2})", llm_regime, llm_confidence);
+            return llm_regime;
+        }
+
+        let current = self.current_regime.unwrap();
+        let samples_in_regime = current_sample - self.regime_start_sample;
+
+        // Same regime - no change needed
+        if llm_regime == current {
+            return current;
+        }
+
+        // ANTI-THRASHING RULES:
+
+        // Rule 1: Too soon to switch (enforce minimum duration)
+        if samples_in_regime < self.min_duration_samples {
+            println!(
+                "  🚫 REGIME TRACKER: BLOCKED switch {:?} → {:?} (only {} samples, need {})",
+                current, llm_regime, samples_in_regime, self.min_duration_samples
+            );
+            return current;
+        }
+
+        // Rule 2: Not confident enough
+        if llm_confidence < self.default_confidence_threshold {
+            println!(
+                "  🚫 REGIME TRACKER: BLOCKED switch {:?} → {:?} (confidence {:.2} < {:.2})",
+                current, llm_regime, llm_confidence, self.default_confidence_threshold
+            );
+            return current;
+        }
+
+        // Rule 3: Extra protection for trends (they persist longer)
+        if matches!(current, MarketRegime::BullTrend | MarketRegime::BearCrash) {
+            if llm_confidence < self.trend_confidence_threshold {
+                println!(
+                    "  🚫 REGIME TRACKER: BLOCKED exit from trend {:?} → {:?} (confidence {:.2} < {:.2})",
+                    current, llm_regime, llm_confidence, self.trend_confidence_threshold
+                );
+                return current;  // Require 90% confidence to exit trends
+            }
+        }
+
+        // All checks passed - allow switch
+        self.switches_count += 1;
+        self.current_regime = Some(llm_regime);
+        self.regime_start_sample = current_sample;
+        println!(
+            "  ✅ REGIME TRACKER: ACCEPTED switch {:?} → {:?} (confidence: {:.2}, held for {} samples, switch #{})",
+            current, llm_regime, llm_confidence, samples_in_regime, self.switches_count
+        );
+        llm_regime
+    }
+
+    fn get_stats(&self) -> (usize, Option<MarketRegime>) {
+        (self.switches_count, self.current_regime)
+    }
+}
+
+/// Strategy Tracker for Option 3 (Direct Strategy Selection)
+///
+/// Similar to RegimeTracker but filters strategy recommendations instead of regimes.
+/// Prevents rapid strategy switching by enforcing minimum duration and confidence thresholds.
+///
+/// Thresholds match the LLM prompt to ensure consistency:
+/// - DCA: 0.65 confidence (default, easy to use)
+/// - Momentum: 0.70-0.85 confidence (for young uptrends)
+/// - Mean Reversion: 0.75+ confidence (for panic crashes)
+struct StrategyTracker {
+    current_strategy: Option<StrategyEnum>,
+    strategy_start_sample: usize,
+    min_duration_hours: usize,  // Minimum hours to hold a strategy (384 hours = 16 days)
+    default_confidence_threshold: f64,  // 0.70 = Momentum/MeanReversion threshold
+    dca_entry_threshold: f64,  // 0.65 = DCA entry (default)
+    dca_exit_threshold: f64,  // 0.70 = Allow exit when LLM has 0.70-0.75 confidence
+    switches_count: usize,
+}
+
+impl StrategyTracker {
+    fn new() -> Self {
+        Self {
+            current_strategy: None,
+            strategy_start_sample: 0,
+            min_duration_hours: 0,  // NO minimum hold - allow tactical flexibility
+            default_confidence_threshold: 0.70,  // Match prompt: Momentum 0.70-0.85, MeanReversion 0.75+
+            dca_entry_threshold: 0.65,  // Match prompt: DCA 0.65
+            dca_exit_threshold: 0.70,  // Match prompt: Allow exit at 0.70-0.75
+            switches_count: 0,
+        }
+    }
+
+    /// Filter LLM's strategy recommendation through anti-thrashing rules
+    ///
+    /// Thresholds match the LLM prompt:
+    /// - TO DCA: 0.65 confidence (default)
+    /// - TO Momentum: 0.70 confidence (for young uptrends)
+    /// - TO Mean Reversion: 0.75 confidence (for panic crashes)
+    /// - FROM DCA: 0.70 confidence (allow exit when LLM confident in alternative)
+    fn should_accept_strategy(
+        &mut self,
+        llm_strategy: StrategyEnum,
+        llm_confidence: f64,
+        current_sample: usize
+    ) -> StrategyEnum {
+        // First detection - accept it
+        if self.current_strategy.is_none() {
+            self.current_strategy = Some(llm_strategy);
+            self.strategy_start_sample = current_sample;
+            println!("  🎯 STRATEGY TRACKER: Initial strategy {:?} (confidence: {:.2})", llm_strategy, llm_confidence);
+            return llm_strategy;
+        }
+
+        let current = self.current_strategy.unwrap();
+        let samples_in_strategy = current_sample - self.strategy_start_sample;
+
+        // Same strategy - no change needed
+        if llm_strategy == current {
+            return current;
+        }
+
+        // ANTI-THRASHING RULES:
+
+        // Rule 1: Too soon to switch (must hold for minimum duration in hours)
+        if samples_in_strategy < self.min_duration_hours {
+            println!(
+                "  🚫 STRATEGY TRACKER: BLOCKED switch {:?} → {:?} (only {} hours, need {} hours / {:.1} days)",
+                current, llm_strategy, samples_in_strategy, self.min_duration_hours, self.min_duration_hours as f64 / 24.0
+            );
+            return current;
+        }
+
+        // Rule 2: Check confidence threshold (SPECIAL HANDLING FOR DCA)
+        let required_confidence = if llm_strategy == StrategyEnum::DCA {
+            // Switching TO DCA: Use lower threshold (DCA is the winner!)
+            self.dca_entry_threshold
+        } else {
+            // Switching TO Momentum/MeanReversion: Use normal threshold
+            self.default_confidence_threshold
+        };
+
+        if llm_confidence < required_confidence {
+            println!(
+                "  🚫 STRATEGY TRACKER: BLOCKED switch {:?} → {:?} (confidence {:.2} < {:.2})",
+                current, llm_strategy, llm_confidence, required_confidence
+            );
+            return current;
+        }
+
+        // Rule 3: Check when exiting DCA to alternative strategy
+        if current == StrategyEnum::DCA {
+            if llm_confidence < self.dca_exit_threshold {
+                println!(
+                    "  🚫 STRATEGY TRACKER: BLOCKED exit from DCA → {:?} (confidence {:.2} < {:.2})",
+                    llm_strategy, llm_confidence, self.dca_exit_threshold
+                );
+                return current;
+            }
+        }
+
+        // All checks passed - allow switch
+        self.switches_count += 1;
+        self.current_strategy = Some(llm_strategy);
+        self.strategy_start_sample = current_sample;
+        println!(
+            "  ✅ STRATEGY TRACKER: ACCEPTED switch {:?} → {:?} (confidence: {:.2}, held for {} hours / {:.1} days, switch #{})",
+            current, llm_strategy, llm_confidence, samples_in_strategy, samples_in_strategy as f64 / 24.0, self.switches_count
+        );
+        llm_strategy
+    }
+
+    fn get_stats(&self) -> (usize, Option<StrategyEnum>) {
+        (self.switches_count, self.current_strategy)
+    }
+}
+
+/// - Sample regime detection every `sample_interval` hours
+/// - Cache regime for intermediate hours
+/// - Anti-thrashing: Enforce minimum duration & confidence thresholds
+/// - Reduces 8760 calls to ~180 calls with 48h sampling
+struct LLMHybridStrategy {
+    momentum: MomentumStrategy,
+    mean_reversion: MeanReversionStrategy,
+    dca: BuyAndHoldStrategy,
+    llm_detector: std::sync::Mutex<LLMRegimeDetector>,
+    regime_tracker: std::sync::Mutex<RegimeTracker>,  // NEW: Anti-thrashing filter
+    sample_interval: usize, // Sample every N candles (based on absolute candle count)
+    call_count: std::sync::Mutex<usize>, // Track number of times generate_signal was called
+    cached_regime: std::sync::Mutex<Option<MarketRegime>>,
+    regime_log: std::sync::Mutex<Vec<(String, String, f64)>>, // (timestamp, regime, confidence)
+}
+
+impl LLMHybridStrategy {
+    fn new(
+        momentum: MomentumStrategy,
+        mean_reversion: MeanReversionStrategy,
+        dca: BuyAndHoldStrategy,
+        llm_detector: LLMRegimeDetector,
+        sample_interval: usize,
+    ) -> Self {
+        Self {
+            momentum,
+            mean_reversion,
+            dca,
+            llm_detector: std::sync::Mutex::new(llm_detector),
+            regime_tracker: std::sync::Mutex::new(RegimeTracker::new()),  // NEW: Initialize tracker
+            sample_interval,
+            call_count: std::sync::Mutex::new(0),
+            cached_regime: std::sync::Mutex::new(None),
+            regime_log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Get regime switching statistics
+    fn get_regime_stats(&self) -> (usize, Option<MarketRegime>) {
+        self.regime_tracker.lock().unwrap().get_stats()
+    }
+
+    /// Save regime detections to file for future caching
+    fn save_regime_log(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let log = self.regime_log.lock().unwrap();
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "timestamp,regime,confidence")?;
+        for (ts, regime, conf) in log.iter() {
+            writeln!(file, "{},{},{:.4}", ts, regime, conf)?;
+        }
+        println!("  💾 Saved {} regime detections to {}", log.len(), path);
+        Ok(())
+    }
+}
+
+impl Strategy for LLMHybridStrategy {
+    fn generate_signal(&self, candles: &[Candle]) -> cryptobot::Result<Signal> {
+        if candles.is_empty() {
+            return Ok(Signal::Hold);
+        }
+
+        // Increment call count and check if we should sample
+        let mut call_count = self.call_count.lock().unwrap();
+        let current_call = *call_count;
+        *call_count += 1;
+        drop(call_count); // Release lock early
+
+        let should_sample = current_call % self.sample_interval == 0;
+
+        if current_call % 100 == 0 || should_sample {
+            println!(
+                "🔍 LLM DEBUG: call #{}, should_sample={}, sample_interval={}",
+                current_call, should_sample, self.sample_interval
+            );
+        }
+
+        let regime = if should_sample {
+            println!("🤖 LLM API CALL at call #{}", current_call);
+            // Time to call LLM API (must use block_in_place to avoid nested runtime error)
+            let regime_result = tokio::task::block_in_place(|| {
+                let mut detector = self.llm_detector.lock().unwrap();
+                tokio::runtime::Handle::current().block_on(async {
+                    detector.detect_regime_with_confidence(candles).await
+                })
+            });
+
+            match regime_result {
+                Ok((llm_regime, llm_confidence)) => {
+                    // Log raw LLM detection for caching
+                    let timestamp = candles.last().unwrap().timestamp.to_rfc3339();
+                    let regime_str = format!("{:?}", llm_regime);
+                    self.regime_log.lock().unwrap().push((timestamp.clone(), regime_str, llm_confidence));
+                    println!("  ✅ LLM RAW: {:?} (confidence: {:.2}) at {}", llm_regime, llm_confidence, timestamp);
+
+                    // Filter through RegimeTracker to prevent thrashing
+                    let mut tracker = self.regime_tracker.lock().unwrap();
+                    let filtered_regime = tracker.should_accept_regime(llm_regime, llm_confidence, current_call);
+                    drop(tracker); // Release lock
+
+                    // Update cached regime with FILTERED result
+                    *self.cached_regime.lock().unwrap() = Some(filtered_regime);
+
+                    filtered_regime
+                }
+                Err(e) => {
+                    println!("  ❌ LLM API ERROR: {}", e);
+                    // Fall back to cached regime or return Hold
+                    match *self.cached_regime.lock().unwrap() {
+                        Some(r) => {
+                            println!("  ↩️  Using last cached regime: {:?}", r);
+                            r
+                        }
+                        None => return Ok(Signal::Hold),
+                    }
+                }
+            }
+        } else {
+            // Use cached regime
+            match *self.cached_regime.lock().unwrap() {
+                Some(r) => r,
+                None => return Ok(Signal::Hold), // Shouldn't happen
+            }
+        };
+
+        // Select strategy based on detected regime
+        match regime {
+            MarketRegime::BullTrend => {
+                if candles.len() < 25 {
+                    return Ok(Signal::Hold);
+                }
+                self.momentum.generate_signal(candles)
+            }
+            MarketRegime::BearCrash => {
+                if candles.len() < 44 {
+                    return Ok(Signal::Hold);
+                }
+                self.mean_reversion.generate_signal(candles)
+            }
+            MarketRegime::ChoppyUnclear | MarketRegime::ChoppyClear => {
+                self.dca.generate_signal(candles)
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "Hybrid (LLM GPT-4)"
+    }
+
+    fn min_candles_required(&self) -> usize {
+        50 // LLM needs 50+ candles for context
+    }
+}
+
+/// Option 3: LLM Direct Strategy Selection (eliminates regime translation layer)
+///
+/// Uses LLM to directly recommend which strategy to use based on market conditions,
+/// without the intermediate regime classification step that was causing mismatches.
+///
+/// Key advantages over regime-based approach:
+/// - No regime → strategy translation layer (source of errors)
+/// - LLM sees historical performance data (DCA: +1.96%, etc.)
+/// - Conservative bias toward proven DCA strategy
+/// - Anti-thrashing with 85% confidence (90% to exit DCA)
+struct LLMDirectStrategyHybrid {
+    momentum: MomentumStrategy,
+    mean_reversion: MeanReversionStrategy,
+    dca: BuyAndHoldStrategy,
+    llm_selector: std::sync::Mutex<LLMStrategySelector>,
+    strategy_tracker: std::sync::Mutex<StrategyTracker>,
+    sample_interval: usize,
+    call_count: std::sync::Mutex<usize>,
+    cached_strategy: std::sync::Mutex<Option<StrategyEnum>>,
+    strategy_log: std::sync::Mutex<Vec<(String, String, f64)>>, // (timestamp, strategy, confidence)
+}
+
+impl LLMDirectStrategyHybrid {
+    fn new(
+        momentum: MomentumStrategy,
+        mean_reversion: MeanReversionStrategy,
+        dca: BuyAndHoldStrategy,
+        llm_selector: LLMStrategySelector,
+        sample_interval: usize,
+    ) -> Self {
+        Self {
+            momentum,
+            mean_reversion,
+            dca,
+            llm_selector: std::sync::Mutex::new(llm_selector),
+            strategy_tracker: std::sync::Mutex::new(StrategyTracker::new()),
+            sample_interval,
+            call_count: std::sync::Mutex::new(0),
+            cached_strategy: std::sync::Mutex::new(None),
+            strategy_log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get_strategy_stats(&self) -> (usize, Option<StrategyEnum>) {
+        self.strategy_tracker.lock().unwrap().get_stats()
+    }
+
+    fn save_strategy_log(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let log = self.strategy_log.lock().unwrap();
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "timestamp,strategy,confidence")?;
+        for (ts, strategy, conf) in log.iter() {
+            writeln!(file, "{},{},{:.4}", ts, strategy, conf)?;
+        }
+        println!("  💾 Saved {} strategy selections to {}", log.len(), path);
+        Ok(())
+    }
+}
+
+impl Strategy for LLMDirectStrategyHybrid {
+    fn generate_signal(&self, candles: &[Candle]) -> cryptobot::Result<Signal> {
+        if candles.is_empty() {
+            return Ok(Signal::Hold);
+        }
+
+        // Increment call count and check if we should sample
+        let mut call_count = self.call_count.lock().unwrap();
+        let current_call = *call_count;
+        *call_count += 1;
+        drop(call_count);
+
+        let should_sample = current_call % self.sample_interval == 0;
+
+        if current_call % 100 == 0 || should_sample {
+            println!(
+                "🔍 DIRECT STRATEGY LLM DEBUG: call #{}, should_sample={}, sample_interval={}",
+                current_call, should_sample, self.sample_interval
+            );
+        }
+
+        let strategy = if should_sample {
+            println!("🤖 LLM API CALL (Direct Strategy) at call #{}", current_call);
+            let strategy_result = tokio::task::block_in_place(|| {
+                let mut selector = self.llm_selector.lock().unwrap();
+                tokio::runtime::Handle::current().block_on(async {
+                    selector.select_strategy_with_confidence(candles).await
+                })
+            });
+
+            match strategy_result {
+                Ok((llm_strategy, llm_confidence)) => {
+                    let timestamp = candles.last().unwrap().timestamp.to_rfc3339();
+                    let strategy_str = format!("{:?}", llm_strategy);
+                    self.strategy_log.lock().unwrap().push((timestamp.clone(), strategy_str, llm_confidence));
+                    println!("  ✅ LLM RAW: {:?} (confidence: {:.2}) at {}", llm_strategy, llm_confidence, timestamp);
+
+                    // Filter through StrategyTracker to prevent thrashing
+                    let mut tracker = self.strategy_tracker.lock().unwrap();
+                    let filtered_strategy = tracker.should_accept_strategy(llm_strategy, llm_confidence, current_call);
+                    drop(tracker);
+
+                    // Update cached strategy with FILTERED result
+                    *self.cached_strategy.lock().unwrap() = Some(filtered_strategy);
+
+                    filtered_strategy
+                }
+                Err(e) => {
+                    println!("  ❌ LLM API ERROR: {}", e);
+                    match *self.cached_strategy.lock().unwrap() {
+                        Some(s) => {
+                            println!("  ↩️  Using last cached strategy: {:?}", s);
+                            s
+                        }
+                        None => return Ok(Signal::Hold),
+                    }
+                }
+            }
+        } else {
+            // Use cached strategy
+            match *self.cached_strategy.lock().unwrap() {
+                Some(s) => s,
+                None => return Ok(Signal::Hold),
+            }
+        };
+
+        // Execute the selected strategy directly
+        match strategy {
+            StrategyEnum::Momentum => {
+                if candles.len() < 25 {
+                    return Ok(Signal::Hold);
+                }
+                self.momentum.generate_signal(candles)
+            }
+            StrategyEnum::MeanReversion => {
+                if candles.len() < 44 {
+                    return Ok(Signal::Hold);
+                }
+                self.mean_reversion.generate_signal(candles)
+            }
+            StrategyEnum::DCA => {
+                self.dca.generate_signal(candles)
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "Hybrid (LLM Direct Strategy)"
+    }
+
+    fn min_candles_required(&self) -> usize {
+        50
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -342,7 +870,59 @@ async fn main() -> Result<()> {
     let confidence_metrics =
         confidence_runner.run(&confidence_hybrid, candles.clone(), "SOL", poll_interval, fee_rate)?;
 
-    // Test 4: DCA baseline
+    // Test 4: LLM-based Hybrid (SKIPPED - Option 1 removed to save time)
+    println!("\n  ⏭️  Skipping LLM Regime-Based test (Option 1 - focusing on Option 3 only)");
+    let llm_metrics: Option<cryptobot::backtest::BacktestMetrics> = None;
+
+    // Test 5: LLM Direct Strategy Selection (Option 3) - No regime translation layer
+    let llm_direct_metrics = if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        println!("\n  🔬 Testing LLM Direct Strategy Selection (Option 3)...");
+        println!("    ✨ NEW APPROACH: No regime classification!");
+        println!("    Detection logic:");
+        println!("      • LLM directly recommends: Momentum, Mean Reversion, or DCA");
+        println!("      • Sees historical performance: DCA +1.96%, Momentum +0.38%, Mean Rev -0.05%");
+        println!("      • Conservative bias toward proven DCA strategy");
+        println!("      • Anti-thrashing: 85% confidence (90% to exit DCA)");
+        println!("      • Samples every 48 hours");
+        println!("      • Est. API calls: ~183 (~$0.33 with gpt-4o-mini)");
+
+        let llm_selector = LLMStrategySelector::new_no_cache(api_key);
+        let llm_direct = LLMDirectStrategyHybrid::new(
+            momentum.clone(),
+            mean_reversion.clone(),
+            buy_and_hold.clone(),
+            llm_selector,
+            48, // Sample every 48 hours
+        );
+
+        let llm_direct_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
+        let metrics = llm_direct_runner.run(&llm_direct, candles.clone(), "SOL", poll_interval, fee_rate)?;
+
+        // Print strategy switching statistics
+        let (switches, final_strategy) = llm_direct.get_strategy_stats();
+        println!("\n  📊 STRATEGY SWITCHING STATISTICS:");
+        println!("      • Total strategy switches: {}", switches);
+        println!("      • Final strategy: {:?}", final_strategy.unwrap_or(StrategyEnum::DCA));
+        if candles.len() > 0 {
+            let total_hours = candles.len() as f64 * (poll_interval as f64 / 60.0);
+            let avg_duration = if switches > 0 {
+                total_hours / (switches as f64 + 1.0)
+            } else {
+                total_hours
+            };
+            println!("      • Average strategy duration: {:.1}h ({:.1} days)", avg_duration, avg_duration / 24.0);
+        }
+
+        // Save strategy selections for analysis
+        llm_direct.save_strategy_log("/tmp/llm_direct_strategy_selections.csv").ok();
+
+        Some(metrics)
+    } else {
+        println!("\n  ⏭️  Skipping LLM Direct Strategy test (OPENAI_API_KEY not set)");
+        None
+    };
+
+    // Test 6: DCA baseline
     println!("\n  🔬 Testing DCA baseline...");
     let dca_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
     let dca_metrics = dca_runner.run(&buy_and_hold, candles.clone(), "SOL", poll_interval, fee_rate)?;
@@ -365,6 +945,26 @@ async fn main() -> Result<()> {
 
     println!("Strategy                       Return%   Trades   vs DCA");
     println!("────────────────────────────────────────────────────────────");
+
+    // Show LLM results first if available
+    if let Some(ref llm_direct) = llm_direct_metrics {
+        println!(
+            "🚀 LLM Direct Strategy (Opt 3) {:+6.2}%    {:4}     {:+.2}%",
+            llm_direct.net_return_pct,
+            llm_direct.total_trades,
+            llm_direct.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
+    if let Some(ref llm) = llm_metrics {
+        println!(
+            "🤖 LLM Regime-based (Opt 1)    {:+6.2}%    {:4}     {:+.2}%",
+            llm.net_return_pct,
+            llm.total_trades,
+            llm.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
     println!(
         "Confidence-Based (Bull≥5.0)    {:+6.2}%    {:4}     {:+.2}%",
         confidence_metrics.net_return_pct,
@@ -404,7 +1004,24 @@ async fn main() -> Result<()> {
 
     // Comparison with baselines
     println!("\n📊 COMPARISON WITH BASELINES:\n");
-    println!("Perfect Hybrid (manual labels):      +3.42% (beats DCA by +1.45%)");
+    println!("Perfect Hybrid (manual labels):         +3.42% (beats DCA by +1.45%)");
+
+    if let Some(ref llm_direct) = llm_direct_metrics {
+        println!(
+            "🚀 LLM Direct Strategy (Option 3):      {:+.2}% (vs DCA: {:+.2}%)",
+            llm_direct.net_return_pct,
+            llm_direct.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
+    if let Some(ref llm) = llm_metrics {
+        println!(
+            "🤖 LLM Regime-based (Option 1):         {:+.2}% (vs DCA: {:+.2}%)",
+            llm.net_return_pct,
+            llm.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
     println!(
         "Confidence-Based (Bull≥5.0, Crash≥4.0): {:+.2}% (vs DCA: {:+.2}%)",
         confidence_metrics.net_return_pct,
