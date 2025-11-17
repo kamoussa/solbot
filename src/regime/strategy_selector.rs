@@ -95,27 +95,38 @@ impl LLMStrategySelector {
 
     /// Select strategy using LLM API
     ///
-    /// Returns (Strategy, confidence_score) where confidence is 0.0-1.0
+    /// Returns (Strategy, confidence_score, reasoning) where confidence is 0.0-1.0
     pub async fn select_strategy_with_confidence(
         &mut self,
         candles: &[Candle],
-    ) -> Result<(Strategy, f64)> {
+    ) -> Result<(Strategy, f64, String)> {
+        self.select_strategy_with_confidence_and_context(candles, None, None).await
+    }
+
+    /// NEW: Version with optional strategy context and drawdown analysis
+    pub async fn select_strategy_with_confidence_and_context(
+        &mut self,
+        candles: &[Candle],
+        strategy_context: Option<String>,
+        drawdown_context: Option<String>,
+    ) -> Result<(Strategy, f64, String)> {
         if candles.len() < 50 {
-            return Ok((Strategy::DCA, 0.0));
+            return Ok((Strategy::DCA, 0.0, "Not enough data".to_string()));
         }
 
         // Create cache key from last candle timestamp
         let cache_key = candles.last().unwrap().timestamp.to_rfc3339();
 
         // Check cache first (only if cache is enabled)
+        // Note: Cache doesn't store reasoning, so return empty string
         if !self.disable_cache {
             if let Some(cached) = self.cache.get(&cache_key) {
-                return Ok(*cached);
+                return Ok((cached.0, cached.1, String::from("Cached result")));
             }
         }
 
         // Prepare market data for LLM
-        let prompt = self.create_prompt(candles)?;
+        let prompt = self.create_prompt_with_context(candles, strategy_context, drawdown_context)?;
 
         // Retry loop with exponential backoff
         let mut retry_count = 0;
@@ -231,14 +242,36 @@ impl LLMStrategySelector {
             };
 
             let confidence = llm_response.confidence.clamp(0.0, 1.0);
+            let reasoning = llm_response.reasoning;
 
-            // Cache result
+            // Cache result (note: we don't cache reasoning for simplicity)
             if !self.disable_cache {
                 self.cache.insert(cache_key, (strategy, confidence));
             }
 
-            return Ok((strategy, confidence));
+            return Ok((strategy, confidence, reasoning));
         }
+    }
+
+    /// Create prompt with optional strategy and drawdown context
+    fn create_prompt_with_context(
+        &self,
+        candles: &[Candle],
+        strategy_context: Option<String>,
+        drawdown_context: Option<String>,
+    ) -> Result<String> {
+        // Get base prompt
+        let mut prompt = self.create_prompt(candles)?;
+
+        // Prepend context sections if provided
+        if let Some(strat_ctx) = strategy_context {
+            prompt = format!("{}\n\n{}", strat_ctx, prompt);
+        }
+        if let Some(dd_ctx) = drawdown_context {
+            prompt = format!("{}\n\n{}", dd_ctx, prompt);
+        }
+
+        Ok(prompt)
     }
 
     /// Create prompt for LLM with market data and strategy descriptions
@@ -264,6 +297,40 @@ impl LLMStrategySelector {
         let price_change_24h =
             if prices.len() >= 24 {
                 ((current_price - prices[prices.len() - 24]) / prices[prices.len() - 24]) * 100.0
+            } else {
+                0.0
+            };
+
+        // ⭐ CRITICAL FIX: Calculate 14-day (336-hour) price change for Momentum detection
+        let price_change_14d =
+            if candles.len() >= 336 {  // 14 days × 24 hours = 336 hours
+                let price_14d_ago = candles[candles.len() - 336].close;
+                ((current_price - price_14d_ago) / price_14d_ago) * 100.0
+            } else {
+                0.0
+            };
+
+        // Calculate 10-day and 7-day changes for early momentum detection
+        let price_change_10d =
+            if candles.len() >= 240 {  // 10 days × 24 hours = 240 hours
+                let price_10d_ago = candles[candles.len() - 240].close;
+                ((current_price - price_10d_ago) / price_10d_ago) * 100.0
+            } else {
+                0.0
+            };
+
+        let price_change_7d =
+            if candles.len() >= 168 {  // 7 days × 24 hours = 168 hours
+                let price_7d_ago = candles[candles.len() - 168].close;
+                ((current_price - price_7d_ago) / price_7d_ago) * 100.0
+            } else {
+                0.0
+            };
+
+        let price_change_3d =
+            if candles.len() >= 72 {  // 3 days × 24 hours = 72 hours
+                let price_3d_ago = candles[candles.len() - 72].close;
+                ((current_price - price_3d_ago) / price_3d_ago) * 100.0
             } else {
                 0.0
             };
@@ -409,12 +476,18 @@ impl LLMStrategySelector {
         };
 
         let prompt = format!(
-            r#"You are an expert cryptocurrency trading strategist. Your PRIMARY GOAL is to maximize returns, not to generate trading signals.
+            r#"You are an expert cryptocurrency trading strategist. Your goal is to maximize returns by selecting the right strategy for current market conditions.
+
+⚠️ IMPORTANT: Switching strategies has COSTS (slippage, missed opportunities, whipsaw). Only switch when you have HIGH CONVICTION (0.85-0.90+ confidence) that market conditions have fundamentally changed.
 
 ## Market Summary (Last 50 Hours)
 - **Current Price**: ${:.2}
 - **1H Change**: {:+.2}%
 - **24H Change**: {:+.2}%
+- **3-Day Change**: {:+.2}% ← Acceleration signal
+- **7-Day Change**: {:+.2}% ← Early momentum signal
+- **10-Day Change**: {:+.2}% ← Primary momentum trigger
+- **14-Day Change**: {:+.2}% ← Confirmation
 - **50H Price Range**: {:.1}% (High: ${:.2}, Low: ${:.2})
 - **Price vs SMA(20)**: {:+.1}% {}
 
@@ -435,107 +508,158 @@ impl LLMStrategySelector {
 
 ## Market Structure
 - **Pattern**: {}
-- **📅 TREND AGE**: Current trend has been running for **{} days**
-  - **Interpretation**:
-    - **< 14 days**: YOUNG trend - BEST opportunity for momentum (early stage)
-    - **14-28 days**: MATURE trend - Mid-stage, proceed with caution
-    - **> 28 days**: OLD trend - High reversal risk, avoid momentum
-- **📈 TREND MATURITY** (Weekly): {}
-  - **CRITICAL**: Trend age determines momentum opportunity timing!
-  - **Young trends (2-3 weeks)**: BEST time for momentum (early stage)
-  - **Mature trends (4-6 weeks)**: Caution, mid-stage, could reverse
-  - **Old trends (7+ weeks)**: AVOID momentum, reversal risk high
 - **Recent candles** (last 20 hours):
 {}
 
 ## Available Strategies - Choose Based on Market Conditions
 
-### 1. DCA (Dollar Cost Averaging) - Default for 70-80% of Year
-- **When it shines**: Choppy markets, sideways trends, unclear direction, mixed signals
-- **Characteristics**: Steady accumulation, consistent buying, works in uncertainty
-- **Best use**: When you DON'T see clear momentum OR panic opportunities
-- **Entry threshold**: 0.65 confidence (easy to use as default)
-- **Typical allocation**: 70-80% of the year (most of the time)
-- **Why it works**: Avoids mistiming entries/exits, captures long-term growth
+### 🚀 1. Momentum Strategy - Capture SUSTAINED Bull Runs (Target: 15-20% of Year)
+- **When to use**: Clear, SUSTAINED uptrends (not just 1-2 good days)
+- **Opportunity**: Catch +20-30% moves during multi-week bull runs
+- **Best timing**: Enter when trend is building but still has room to run
+- **✅ REQUIREMENTS - Need SOLID signals (confidence 0.80-0.95)**:
+  1. **Price up 6%+ in last 7-10 days** (sustained move, not just a bounce)
+  2. **ADX > 20** (clear trend forming, not just noise)
+  3. **RSI 50-75** (momentum present but not overbought)
+  4. **Price > SMA(20) preferred** (structure confirms uptrend)
+- **Confidence levels** (UPDATED for 48h sampling):
+  - 6-8% in 7-10d + ADX >20 + RSI 50-75 → 0.80-0.85 confidence
+  - 8-10% in 7-10d + ADX >23 + RSI 52-70 → 0.85-0.88 confidence
+  - 10%+ in 10d + ADX >25 + acceleration signals → 0.90+ confidence
+- **Acceleration signals** (boost confidence +0.05):
+  - 3-day change > 3%: Momentum building
+  - 7-day change > 5%: Strong trend
+  - Price breaking recent highs: Breakout momentum
+- **Entry threshold**: 0.80+ confidence to switch (lowered to catch real bull runs)
+- **Why this works**: Catches bull runs early while maintaining conviction
+- **Target allocation**: 15-20% of the year (selective but achievable)
 
-### 2. Momentum Strategy - Capture Early Bull Runs (10-15% of Year)
-- **When it shines**: YOUNG, strong uptrends in early stages (2-3 weeks old)
-- **Opportunity**: Can capture +20-30% moves during bull runs
-- **Best timing**: Enter EARLY in trend formation (week 1-3), exit before maturity
-- **⏰ CRITICAL - Trend Age Matters**:
-  - **✅ YOUNG (2-3 weeks)**: BEST opportunity, early stage, room to run → confidence 0.70-0.85
-  - **⚠️ MATURE (4-6 weeks)**: Mid-stage, higher reversal risk → confidence 0.60-0.70
-  - **❌ OLD (7+ weeks)**: Late stage, reversal imminent → DO NOT USE, back to DCA
-- **Requirements for entry (ALL must be met)**:
-  - **Trend age ≤6 weeks** (check Trend Maturity section above!)
-  - ADX > 30 (very strong trend, not weak 20-25)
-  - Clear higher highs AND higher lows pattern (7+ days)
-  - +DI > -DI by at least 10 points (bullish momentum)
-  - RSI 40-65 (room to run, not overbought 70+)
-  - Price > SMA(20) with expanding range
-- **Entry threshold**: 0.70 confidence
-- **Typical allocation**: 10-15% of the year (rare but high-impact opportunities)
-
-### 3. Mean Reversion Strategy - Catch Panic Bounces (5-10% of Year)
-- **When it shines**: EXTREME panic crashes with capitulation (RSI < 20)
-- **Opportunity**: Can catch +5-10% bounces after fear peaks
+### 💥 2. Mean Reversion Strategy - Panic Crashes & Bear Capitulation (Target: 10-15% of Year)
+- **When to use**: EXTREME panic crashes OR gradual bear market capitulation
+- **Opportunity**: Catch +5-10% bounces after fear peaks
 - **Best timing**: Enter AFTER panic selling peaks, when fear is maximum
-- **Requirements for entry (ALL must be met)**:
-  - RSI < 20 (extreme oversold, not just 30-40)
-  - Price dropped > 15% in last 48 hours (true panic, not just -5-10%)
-  - Volume > 2.0x average (massive panic selling, not just 1.3-1.5x)
-  - Price < 20th percentile of 90-day range (near lows)
-  - Clear capitulation pattern (sellers exhausted)
-- **Entry threshold**: 0.75 confidence
-- **Typical allocation**: 5-10% of the year (very rare panic events)
+- **✅ TWO TYPES OF PANIC - Either triggers Mean Reversion**:
 
-## CRITICAL RULES FOR OPPORTUNITY IDENTIFICATION
+  **A) FLASH CRASH (confidence 0.85-0.95) - ALL must be met**:
+  - RSI < 20 (extreme oversold)
+  - Price dropped > 15% in last 48 hours (massive panic)
+  - Volume > 2.0x average (panic selling)
+  - Price < 20th percentile of 90-day range
 
-**🎯 YOUR GOAL: MAXIMIZE RETURNS BY IDENTIFYING THE RIGHT OPPORTUNITIES**
+  **B) GRADUAL BEAR CAPITULATION (confidence 0.80-0.90) - ALL must be met**:
+  - Price down 20%+ from 30-day high (extended decline)
+  - RSI < 30 (oversold, sellers exhausted)
+  - Price in bottom 15th percentile of 90-day range (near lows)
+  - Recent 3-7 day decline slowing (capitulation ending)
 
-1. **Most of the year is DCA territory (70-80%)**
-   - Use DCA with 0.65+ confidence when market is choppy/mixed/unclear
-   - DCA is the DEFAULT - you need to see clear opportunities to switch
+- **Entry threshold**: 0.80+ confidence to switch
+- **Target allocation**: 10-15% of the year (includes gradual bears)
 
-2. **Look for HIGH-CONVICTION opportunities to switch**:
-   - **Momentum**: Young uptrend (2-3 weeks) + ADX >30 + all conditions → confidence 0.70-0.85
-   - **Mean Reversion**: Panic crash (RSI <20, -15%+ drop, 2x volume) → confidence 0.75+
-   - If you don't see these clear setups → Stay in DCA (0.65+ confidence)
+### 📊 3. DCA (Dollar Cost Averaging) - Default for Uncertain Markets (Target: 65-75% of Year)
+- **When to use**: When markets are choppy, sideways, mixed, OR you lack conviction
+- **This IS the default**: Most of the time, markets don't have clear momentum or panic
+- **Characteristics**: Steady accumulation, works in uncertainty
+- **Use when**: No clear momentum (price change <10% in 14d) AND no panic conditions
+- **Entry threshold**: 0.60-0.70 confidence (this is the safe, proven choice)
+- **Target allocation**: 65-75% of the year (this is normal and expected!)
+- **Why it works**: Returns +1.96% baseline - hard to beat consistently
 
-3. **Momentum is about TIMING (trend age is critical)**:
-   - YOUNG trends (2-3 weeks): BEST opportunity for momentum (early stage)
-   - MATURE trends (4-6 weeks): Risky, late-stage, prefer DCA
-   - OLD trends (7+ weeks): Reversal imminent, DO NOT USE momentum
+## CRITICAL RULES FOR STRATEGY SELECTION
 
-4. **Mean Reversion is about EXTREMES (not every dip)**:
-   - Small dips (RSI 35-40, -5-8% drop): NOT extreme → DCA
-   - True panic (RSI <20, -15%+ drop, high volume): Mean Reversion opportunity
-   - Capitulation is key - enter when fear peaks, not on the way down
+**🎯 YOUR GOAL: Select the right strategy AND minimize costly switches**
 
-5. **Confidence Calibration**:
-   - **DCA**: 0.65+ (easy default for uncertain/choppy markets)
-   - **Momentum**: 0.70-0.85 (young trend + all conditions met)
-   - **Mean Reversion**: 0.75+ (extreme panic + all conditions met)
+1. **Switching has REAL COSTS**
+   - Every strategy switch costs ~0.5-1% in slippage and missed opportunities
+   - Rapid switching (thrashing) destroys returns
+   - Only switch with 0.85+ confidence when market fundamentally changes
+   - When in doubt, STAY in current strategy
 
-## Decision Framework
+2. **Momentum requires SUSTAINED signals (0.80-0.95 confidence) - UPDATED THRESHOLDS**:
+   - **Not just a bounce**: Need 6%+ move over 7-10 days (building trend)
+   - **Trend confirmation**: ADX >20, RSI 50-75, price > SMA(20) preferred
+   - **Avoid false starts**: Look for multi-day consistency, not single spikes
+   - **Confidence tiers** (LOWERED to match 48h sampling):
+     - 6-8% in 7-10d + ADX >20 → 0.80-0.85 (good to switch)
+     - 8-10% in 7-10d + ADX >23 → 0.85-0.88 (strong signal)
+     - 10%+ in 10d + ADX >25 + acceleration → 0.90+ (excellent)
+   - **Target**: 15-20% of year (selective opportunities)
 
-**Step 1**: Check Trend Maturity (if there's a trend)
-- Young uptrend (2-3 weeks) + ADX >30 + conditions met → **Consider Momentum** (0.70-0.85)
-- Mature/Old uptrend (4+ weeks) → **Stay in DCA** (0.65+)
-- No clear trend → **Use DCA** (0.65+)
+3. **Mean Reversion for EXTREMES & GRADUAL BEARS (0.80-0.95 confidence) - UPDATED**:
+   - Small dips (RSI 30-40, -5-10% drop): Use DCA, not Mean Reversion
+   - Flash crash (RSI <20, -15%+ in 48h, 2x+ volume): Mean Reversion (0.85-0.95)
+   - Gradual bear (down 20%+ from 30d high, RSI <30, bottom 15%): Mean Reversion (0.80-0.90)
+   - **Target**: 10-15% of year (includes both flash crashes and bear capitulations)
 
-**Step 2**: Check for Panic Crash
-- RSI <20 + price -15%+ in 48h + 2x volume → **Consider Mean Reversion** (0.75+)
-- Normal dip (RSI 30-40, modest drop) → **Use DCA** (0.65+)
+4. **DCA is the PROVEN DEFAULT (0.60-0.70 confidence)**:
+   - Returns +1.96% baseline (hard to beat consistently)
+   - Use when: no clear momentum (price <8% in 14d) AND no panic
+   - **This is NORMAL**: 65-75% of year should be DCA
+   - DCA isn't "giving up" - it's the smart choice in choppy markets
 
-**Step 3**: If neither clear opportunity → **Use DCA** (0.65+)
-- Most of the year doesn't have clear momentum or panic setups
-- DCA is the steady default for choppy/uncertain markets
+5. **Confidence Calibration - UPDATED FOR 48H SAMPLING**:
+   - **Momentum**: 0.80-0.95 (HIGH conviction, LOWERED to catch real bull runs)
+   - **Mean Reversion**: 0.80-0.95 (flash crashes + gradual bears, LOWERED)
+   - **DCA**: 0.60-0.70 (low threshold, this is the safe default)
+   - **When uncertain (<0.80)**: Stay in DCA or current strategy
 
-**Step 4**: Adjust confidence based on conviction
-- All conditions strongly met → Higher confidence (0.75-0.85)
-- Some conditions partially met → Lower confidence (0.65-0.70)
-- Conditions not met → DCA (0.65+)
+## Decision Framework - Evaluate Carefully Before Switching
+
+**Step 1: CHECK FOR SUSTAINED MOMENTUM** (15-20% of year) - UPDATED THRESHOLDS
+- Check recent price changes: 3d, 7d, 10d (focus on shorter windows with 48h sampling)
+- **EXCELLENT Momentum** (confidence 0.90-0.95):
+  - Price up 10%+ in 7-10 days (strong sustained move)
+  - ADX > 25 (very strong trend)
+  - RSI 55-70 (strong but not overbought)
+  - 3d change >3% OR 7d change >5% (accelerating trend)
+  - Price > SMA(20) AND making higher highs
+  - → **Recommend MOMENTUM with 0.90-0.95 confidence**
+
+- **STRONG Momentum** (confidence 0.85-0.88):
+  - Price up 8-10% in 7-10 days
+  - ADX > 23 (clear strong trend)
+  - RSI 52-72 (momentum present)
+  - Price > SMA(20)
+  - → **Recommend MOMENTUM with 0.85-0.88 confidence**
+
+- **GOOD Momentum** (confidence 0.80-0.85):
+  - Price up 6-8% in 7-10 days (building trend)
+  - ADX > 20 (trend forming)
+  - RSI 50-75 (room to run)
+  - Price near or above SMA(20)
+  - → **Recommend MOMENTUM with 0.80-0.85 confidence**
+
+- **Weak signals** (price <6% in 10d OR ADX <20): → Continue to Step 2
+
+**Step 2: CHECK FOR PANIC / BEAR CAPITULATION** (10-15% of year) - UPDATED
+- **Flash Crash Capitulation** (confidence 0.85-0.95):
+  - RSI < 20 (extreme oversold)
+  - Price -15%+ in 48h (massive drop)
+  - Volume > 2x average (panic selling)
+  - Price < 20th percentile of 90d range
+  - ALL conditions must be met
+  - → **Recommend MEAN REVERSION with 0.85-0.95 confidence**
+
+- **Gradual Bear Capitulation** (confidence 0.80-0.90) - NEW:
+  - Price down 20%+ from 30-day high (extended decline)
+  - RSI < 30 (oversold, sellers exhausted)
+  - Price in bottom 15th percentile of 90d range (near lows)
+  - Recent 3-7 day decline slowing (capitulation ending)
+  - ALL conditions must be met
+  - → **Recommend MEAN REVERSION with 0.80-0.90 confidence**
+
+- **Normal dip** (RSI 30-40, modest -10-15% drop): → Continue to Step 3
+
+**Step 3: DEFAULT TO DCA** (60-70% of year - this is normal!) - UPDATED
+- No sustained momentum (price <6% in 10d OR ADX <20)
+- No panic/bear capitulation conditions
+- Markets are choppy, sideways, or uncertain
+- Market is choppy, sideways, uncertain, or mixed
+- → **Recommend DCA with 0.60-0.70 confidence**
+
+**Step 4: Final confidence check**
+- If ALL key signals strongly aligned → Keep high confidence (0.88-0.95)
+- If signals are mixed or marginal → Use DCA (0.65)
+- Remember: Switching costs money - need 0.85+ to justify a switch!
 
 Respond ONLY with valid JSON (no markdown, no code blocks):
 
@@ -548,6 +672,10 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
             current_price,
             price_change_1h,
             price_change_24h,
+            price_change_3d,
+            price_change_7d,
+            price_change_10d,
+            price_change_14d,
             price_range,
             price_max_50,
             price_min_50,
@@ -592,8 +720,6 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
                 "(normal)"
             },
             structure_str,
-            trend_age_days,
-            trend_maturity_note,
             candle_data.join(",\n")
         );
 

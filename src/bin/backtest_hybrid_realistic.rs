@@ -344,6 +344,96 @@ impl RegimeTracker {
     }
 }
 
+/// Drawdown analysis result
+#[derive(Debug)]
+struct DrawdownAnalysis {
+    high_30d: f64,
+    high_90d: f64,
+    drawdown_from_30d_pct: f64,
+    drawdown_from_90d_pct: f64,
+    days_since_30d_high: usize,
+    days_since_90d_high: usize,
+    trend_30d_pct: f64,  // % change over last 30 days
+}
+
+/// Calculate drawdown metrics from price candles
+fn calculate_drawdown_analysis(candles: &[Candle], current_price: f64) -> DrawdownAnalysis {
+    // Find highest price in last 30 days (720 hours)
+    let candles_30d: Vec<&Candle> = candles.iter().rev().take(720).collect();
+    let high_30d = candles_30d.iter()
+        .map(|c| c.high)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(current_price);
+
+    // Days since 30d high
+    let days_since_30d_high = candles_30d.iter()
+        .position(|c| c.high == high_30d)
+        .unwrap_or(0) / 24;
+
+    // Find highest price in last 90 days (2160 hours)
+    let candles_90d: Vec<&Candle> = candles.iter().rev().take(2160).collect();
+    let high_90d = candles_90d.iter()
+        .map(|c| c.high)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(current_price);
+
+    // Days since 90d high
+    let days_since_90d_high = candles_90d.iter()
+        .position(|c| c.high == high_90d)
+        .unwrap_or(0) / 24;
+
+    // Drawdowns
+    let drawdown_from_30d_pct = ((current_price - high_30d) / high_30d) * 100.0;
+    let drawdown_from_90d_pct = ((current_price - high_90d) / high_90d) * 100.0;
+
+    // 30-day trend (compare current to 30 days ago)
+    let price_30d_ago = candles.iter().rev().nth(720).map(|c| c.close).unwrap_or(current_price);
+    let trend_30d_pct = ((current_price - price_30d_ago) / price_30d_ago) * 100.0;
+
+    DrawdownAnalysis {
+        high_30d,
+        high_90d,
+        drawdown_from_30d_pct,
+        drawdown_from_90d_pct,
+        days_since_30d_high,
+        days_since_90d_high,
+        trend_30d_pct,
+    }
+}
+
+/// Format drawdown analysis for LLM context
+fn format_drawdown_context(dd: &DrawdownAnalysis, current_price: f64) -> String {
+    let mut context = String::new();
+
+    context.push_str("**DRAWDOWN ANALYSIS:**\n");
+    context.push_str(&format!("  - Current price: ${:.2}\n", current_price));
+    context.push_str(&format!("  - 30-day high: ${:.2} ({:.1}% drawdown, {} days ago)\n",
+        dd.high_30d, dd.drawdown_from_30d_pct, dd.days_since_30d_high));
+    context.push_str(&format!("  - 90-day high: ${:.2} ({:.1}% drawdown, {} days ago)\n",
+        dd.high_90d, dd.drawdown_from_90d_pct, dd.days_since_90d_high));
+    context.push_str(&format!("  - 30-day trend: {:.1}% {}\n",
+        dd.trend_30d_pct.abs(),
+        if dd.trend_30d_pct >= 0.0 { "UP" } else { "DOWN" }));
+
+    // Interpretation
+    if dd.drawdown_from_30d_pct < -20.0 {
+        context.push_str(&format!(
+            "  → ⚠️  SIGNIFICANT DOWNTREND: Price is {:.1}% below 30-day high. This is a SUSTAINED SELLOFF, not just noise.\n",
+            dd.drawdown_from_30d_pct.abs()
+        ));
+        if dd.trend_30d_pct < 0.0 {
+            context.push_str(&format!(
+                "  → Price down {:.1}% over 30 days confirms bearish momentum. Dead cat bounces are likely.\n",
+                dd.trend_30d_pct.abs()
+            ));
+        }
+    } else if dd.drawdown_from_30d_pct > -5.0 && dd.trend_30d_pct > 5.0 {
+        context.push_str("  → ✅ HEALTHY UPTREND: Near recent highs with positive 30d trend.\n");
+    }
+
+    context
+}
+
 /// Strategy Tracker for Option 3 (Direct Strategy Selection)
 ///
 /// Similar to RegimeTracker but filters strategy recommendations instead of regimes.
@@ -353,6 +443,10 @@ impl RegimeTracker {
 /// - DCA: 0.65 confidence (default, easy to use)
 /// - Momentum: 0.70-0.85 confidence (for young uptrends)
 /// - Mean Reversion: 0.75+ confidence (for panic crashes)
+///
+/// Position-aware switching:
+/// - Blocks switches FROM Momentum/MeanReversion when a position is open
+/// - Allows switches FROM DCA anytime (no positions to protect)
 struct StrategyTracker {
     current_strategy: Option<StrategyEnum>,
     strategy_start_sample: usize,
@@ -361,6 +455,9 @@ struct StrategyTracker {
     dca_entry_threshold: f64,  // 0.65 = DCA entry (default)
     dca_exit_threshold: f64,  // 0.70 = Allow exit when LLM has 0.70-0.75 confidence
     switches_count: usize,
+    // NEW: Track recent strategy history for trend memory
+    strategy_history: Vec<(StrategyEnum, usize, f64)>,  // (strategy, start_sample, entry_confidence)
+    entry_confidence: f64,  // Confidence when we entered current strategy
 }
 
 impl StrategyTracker {
@@ -369,30 +466,33 @@ impl StrategyTracker {
             current_strategy: None,
             strategy_start_sample: 0,
             min_duration_hours: 0,  // NO minimum hold - allow tactical flexibility
-            default_confidence_threshold: 0.70,  // Match prompt: Momentum 0.70-0.85, MeanReversion 0.75+
+            default_confidence_threshold: 0.80,  // LOWERED: 80% confidence to catch real bull runs (updated for 48h sampling)
             dca_entry_threshold: 0.65,  // Match prompt: DCA 0.65
-            dca_exit_threshold: 0.70,  // Match prompt: Allow exit at 0.70-0.75
+            dca_exit_threshold: 0.80,  // LOWERED: 80% confidence to exit DCA (matches updated LLM "GOOD Momentum" tier)
             switches_count: 0,
+            strategy_history: Vec::new(),
+            entry_confidence: 0.0,
         }
     }
 
     /// Filter LLM's strategy recommendation through anti-thrashing rules
     ///
-    /// Thresholds match the LLM prompt:
-    /// - TO DCA: 0.65 confidence (default)
-    /// - TO Momentum: 0.70 confidence (for young uptrends)
-    /// - TO Mean Reversion: 0.75 confidence (for panic crashes)
-    /// - FROM DCA: 0.70 confidence (allow exit when LLM confident in alternative)
+    /// Thresholds match the UPDATED LLM prompt (lowered for 48h sampling):
+    /// - TO DCA: 0.65 confidence (default, unchanged)
+    /// - TO Momentum: 0.80 confidence (LOWERED from 0.85 to catch real bull runs)
+    /// - TO Mean Reversion: 0.80 confidence (LOWERED from 0.85, includes gradual bears)
+    /// - FROM DCA: 0.80 confidence (allow exit when LLM has conviction in alternative)
     fn should_accept_strategy(
         &mut self,
         llm_strategy: StrategyEnum,
         llm_confidence: f64,
-        current_sample: usize
+        current_sample: usize,
     ) -> StrategyEnum {
         // First detection - accept it
         if self.current_strategy.is_none() {
             self.current_strategy = Some(llm_strategy);
             self.strategy_start_sample = current_sample;
+            self.entry_confidence = llm_confidence;
             println!("  🎯 STRATEGY TRACKER: Initial strategy {:?} (confidence: {:.2})", llm_strategy, llm_confidence);
             return llm_strategy;
         }
@@ -446,8 +546,17 @@ impl StrategyTracker {
 
         // All checks passed - allow switch
         self.switches_count += 1;
+
+        // Record old strategy to history before switching
+        self.strategy_history.push((current, self.strategy_start_sample, self.entry_confidence));
+        // Keep only last 3 entries for context
+        if self.strategy_history.len() > 3 {
+            self.strategy_history.remove(0);
+        }
+
         self.current_strategy = Some(llm_strategy);
         self.strategy_start_sample = current_sample;
+        self.entry_confidence = llm_confidence;
         println!(
             "  ✅ STRATEGY TRACKER: ACCEPTED switch {:?} → {:?} (confidence: {:.2}, held for {} hours / {:.1} days, switch #{})",
             current, llm_strategy, llm_confidence, samples_in_strategy, samples_in_strategy as f64 / 24.0, self.switches_count
@@ -457,6 +566,51 @@ impl StrategyTracker {
 
     fn get_stats(&self) -> (usize, Option<StrategyEnum>) {
         (self.switches_count, self.current_strategy)
+    }
+
+    /// Generate formatted strategy context for LLM
+    fn get_strategy_context(&self, current_sample: usize) -> String {
+        let mut context = String::new();
+
+        if let Some(current) = self.current_strategy {
+            let hours_active = current_sample - self.strategy_start_sample;
+            let days_active = hours_active as f64 / 24.0;
+
+            context.push_str(&format!(
+                "**CURRENT STRATEGY STATE:**\n  - Active strategy: {:?} (since {:.1} days ago at {:.2} confidence)\n",
+                current, days_active, self.entry_confidence
+            ));
+
+            // Show recent history if any
+            if !self.strategy_history.is_empty() {
+                context.push_str("  - Recent history: ");
+                for (strategy, start_sample, _confidence) in &self.strategy_history {
+                    let duration_hours = if let Some(next_entry) = self.strategy_history.iter()
+                        .position(|(s, ss, _)| s == strategy && ss == start_sample)
+                        .and_then(|idx| self.strategy_history.get(idx + 1))
+                    {
+                        next_entry.1 - start_sample
+                    } else {
+                        self.strategy_start_sample - start_sample
+                    };
+                    let duration_days = duration_hours as f64 / 24.0;
+                    context.push_str(&format!("{:?} ({:.1}d) → ", strategy, duration_days));
+                }
+                context.push_str(&format!("{:?} ({:.1}d) ← YOU ARE HERE\n", current, days_active));
+            }
+
+            // Anti-thrashing warning
+            if hours_active < 96 {  // Less than 4 days
+                context.push_str(&format!(
+                    "  - ⚠️  WARNING: You switched to {:?} only {:.1} days ago. Avoid thrashing unless there's a STRONG reversal signal (confidence ≥ 0.90).\n",
+                    current, days_active
+                ));
+            }
+        } else {
+            context.push_str("**CURRENT STRATEGY STATE:** No active strategy yet (first decision)\n");
+        }
+
+        context
     }
 }
 
@@ -624,6 +778,7 @@ impl Strategy for LLMHybridStrategy {
 /// - LLM sees historical performance data (DCA: +1.96%, etc.)
 /// - Conservative bias toward proven DCA strategy
 /// - Anti-thrashing with 85% confidence (90% to exit DCA)
+/// - Position-aware switching: blocks strategy changes when position is open
 struct LLMDirectStrategyHybrid {
     momentum: MomentumStrategy,
     mean_reversion: MeanReversionStrategy,
@@ -633,7 +788,7 @@ struct LLMDirectStrategyHybrid {
     sample_interval: usize,
     call_count: std::sync::Mutex<usize>,
     cached_strategy: std::sync::Mutex<Option<StrategyEnum>>,
-    strategy_log: std::sync::Mutex<Vec<(String, String, f64)>>, // (timestamp, strategy, confidence)
+    strategy_log: std::sync::Mutex<Vec<(String, String, f64, String)>>, // (timestamp, strategy, confidence, reasoning)
 }
 
 impl LLMDirectStrategyHybrid {
@@ -665,9 +820,11 @@ impl LLMDirectStrategyHybrid {
         use std::io::Write;
         let log = self.strategy_log.lock().unwrap();
         let mut file = std::fs::File::create(path)?;
-        writeln!(file, "timestamp,strategy,confidence")?;
-        for (ts, strategy, conf) in log.iter() {
-            writeln!(file, "{},{},{:.4}", ts, strategy, conf)?;
+        writeln!(file, "timestamp,strategy,confidence,reasoning")?;
+        for (ts, strategy, conf, reasoning) in log.iter() {
+            // Escape reasoning for CSV (replace quotes and commas)
+            let escaped_reasoning = reasoning.replace("\"", "\"\"");
+            writeln!(file, "{},{},{:.4},\"{}\"", ts, strategy, conf, escaped_reasoning)?;
         }
         println!("  💾 Saved {} strategy selections to {}", log.len(), path);
         Ok(())
@@ -697,21 +854,39 @@ impl Strategy for LLMDirectStrategyHybrid {
 
         let strategy = if should_sample {
             println!("🤖 LLM API CALL (Direct Strategy) at call #{}", current_call);
+
+            // Generate strategy context from tracker
+            let strategy_context = {
+                let tracker = self.strategy_tracker.lock().unwrap();
+                tracker.get_strategy_context(current_call)
+            };
+
+            // Generate drawdown analysis
+            let current_price = candles.last().unwrap().close;
+            let drawdown_analysis = calculate_drawdown_analysis(candles, current_price);
+            let drawdown_context = format_drawdown_context(&drawdown_analysis, current_price);
+
             let strategy_result = tokio::task::block_in_place(|| {
                 let mut selector = self.llm_selector.lock().unwrap();
                 tokio::runtime::Handle::current().block_on(async {
-                    selector.select_strategy_with_confidence(candles).await
+                    selector.select_strategy_with_confidence_and_context(
+                        candles,
+                        Some(strategy_context),
+                        Some(drawdown_context)
+                    ).await
                 })
             });
 
             match strategy_result {
-                Ok((llm_strategy, llm_confidence)) => {
+                Ok((llm_strategy, llm_confidence, llm_reasoning)) => {
                     let timestamp = candles.last().unwrap().timestamp.to_rfc3339();
                     let strategy_str = format!("{:?}", llm_strategy);
-                    self.strategy_log.lock().unwrap().push((timestamp.clone(), strategy_str, llm_confidence));
+                    self.strategy_log.lock().unwrap().push((timestamp.clone(), strategy_str, llm_confidence, llm_reasoning.clone()));
                     println!("  ✅ LLM RAW: {:?} (confidence: {:.2}) at {}", llm_strategy, llm_confidence, timestamp);
+                    println!("      💭 Reasoning: {}", llm_reasoning);
 
                     // Filter through StrategyTracker to prevent thrashing
+                    // Pass current position state to enable position-aware switching
                     let mut tracker = self.strategy_tracker.lock().unwrap();
                     let filtered_strategy = tracker.should_accept_strategy(llm_strategy, llm_confidence, current_call);
                     drop(tracker);
@@ -741,23 +916,25 @@ impl Strategy for LLMDirectStrategyHybrid {
         };
 
         // Execute the selected strategy directly
-        match strategy {
+        let signal = match strategy {
             StrategyEnum::Momentum => {
                 if candles.len() < 25 {
                     return Ok(Signal::Hold);
                 }
-                self.momentum.generate_signal(candles)
+                self.momentum.generate_signal(candles)?
             }
             StrategyEnum::MeanReversion => {
                 if candles.len() < 44 {
                     return Ok(Signal::Hold);
                 }
-                self.mean_reversion.generate_signal(candles)
+                self.mean_reversion.generate_signal(candles)?
             }
             StrategyEnum::DCA => {
-                self.dca.generate_signal(candles)
+                self.dca.generate_signal(candles)?
             }
-        }
+        };
+
+        Ok(signal)
     }
 
     fn name(&self) -> &str {
@@ -881,8 +1058,8 @@ async fn main() -> Result<()> {
         println!("    Detection logic:");
         println!("      • LLM directly recommends: Momentum, Mean Reversion, or DCA");
         println!("      • Sees historical performance: DCA +1.96%, Momentum +0.38%, Mean Rev -0.05%");
-        println!("      • Conservative bias toward proven DCA strategy");
-        println!("      • Anti-thrashing: 85% confidence (90% to exit DCA)");
+        println!("      • Moderate bias toward proven DCA strategy");
+        println!("      • Anti-thrashing: 85% confidence to switch (85% to exit DCA)");
         println!("      • Samples every 48 hours");
         println!("      • Est. API calls: ~183 (~$0.33 with gpt-4o-mini)");
 
