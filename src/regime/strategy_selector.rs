@@ -31,6 +31,34 @@ impl Strategy {
     }
 }
 
+// NEW: Direct trading signals (Buy/Sell/Hold)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingSignal {
+    Buy,
+    Sell,
+    Hold,
+}
+
+impl TradingSignal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TradingSignal::Buy => "Buy",
+            TradingSignal::Sell => "Sell",
+            TradingSignal::Hold => "Hold",
+        }
+    }
+}
+
+// Position context for LLM trading decisions
+#[derive(Debug, Clone)]
+pub struct PositionContext {
+    pub has_position: bool,
+    pub entry_price: Option<f64>,
+    pub current_price: f64,
+    pub pnl_percent: Option<f64>,
+    pub days_held: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 struct OpenAIRequest {
     model: String,
@@ -63,6 +91,13 @@ struct MessageContent {
 #[derive(Debug, Deserialize)]
 pub struct LLMStrategyResponse {
     pub strategy: String,
+    pub confidence: f64,
+    pub reasoning: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LLMTradingResponse {
+    pub action: String,  // "Buy", "Sell", or "Hold"
     pub confidence: f64,
     pub reasoning: String,
 }
@@ -734,5 +769,265 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
     /// Get cache size
     pub fn cache_size(&self) -> usize {
         self.cache.len()
+    }
+
+    /// NEW: Get direct trading signal (Buy/Sell/Hold) from LLM
+    ///
+    /// Returns (TradingSignal, confidence_score, reasoning) where confidence is 0.0-1.0
+    pub async fn get_trading_signal_with_context(
+        &mut self,
+        candles: &[Candle],
+        position: &PositionContext,
+    ) -> Result<(TradingSignal, f64, String)> {
+        if candles.len() < 50 {
+            return Ok((TradingSignal::Hold, 0.0, "Not enough data".to_string()));
+        }
+
+        // Create cache key from last candle timestamp + position state
+        let cache_key = format!(
+            "{}_{}_{}",
+            candles.last().unwrap().timestamp.to_rfc3339(),
+            position.has_position,
+            position.entry_price.unwrap_or(0.0)
+        );
+
+        // Check cache first (only if cache is enabled)
+        // TODO: Implement caching for trading signals if needed
+
+        // Prepare market data + position context for LLM
+        // OPTION D: Route to specialized prompts based on position state
+        let prompt = if position.has_position {
+            self.create_exit_prompt(candles, position)?
+        } else {
+            self.create_entry_prompt(candles)?
+        };
+
+        // Retry loop with exponential backoff (same as strategy selection)
+        let mut retry_count = 0;
+        let mut last_error = String::new();
+
+        loop {
+            // Rate limiting
+            if retry_count > 0 {
+                let delay_ms = RATE_LIMIT_DELAY_MS * (2_u64.pow(retry_count - 1));
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            } else if !self.disable_cache {
+                tokio::time::sleep(tokio::time::Duration::from_millis(RATE_LIMIT_DELAY_MS)).await;
+            }
+
+            // Call OpenAI API
+            let request = OpenAIRequest {
+                model: MODEL.to_string(),
+                max_tokens: MAX_TOKENS,
+                temperature: 0.0,
+                messages: vec![
+                    Message {
+                        role: "system".to_string(),
+                        content: "You are a professional cryptocurrency swing trader. Analyze market conditions and provide a clear Buy, Sell, or Hold recommendation with confidence score and reasoning.".to_string(),
+                    },
+                    Message {
+                        role: "user".to_string(),
+                        content: prompt.clone(),
+                    },
+                ],
+            };
+
+            let response = self
+                .client
+                .post(OPENAI_API_URL)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request)
+                .send()
+                .await;
+
+            match response {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        last_error = format!("HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                        retry_count += 1;
+                        if retry_count >= MAX_RETRIES {
+                            return Err(anyhow::anyhow!("API request failed after {} retries: {}", MAX_RETRIES, last_error).into());
+                        }
+                        continue;
+                    }
+
+                    let api_response: OpenAIResponse = resp.json().await?;
+                    let content = &api_response.choices[0].message.content;
+
+                    // Parse JSON response
+                    let parsed: LLMTradingResponse = serde_json::from_str(content)?;
+
+                    // Map action string to TradingSignal enum
+                    let signal = match parsed.action.to_lowercase().as_str() {
+                        "buy" => TradingSignal::Buy,
+                        "sell" => TradingSignal::Sell,
+                        "hold" => TradingSignal::Hold,
+                        _ => return Err(anyhow::anyhow!("Unknown trading signal: {}", parsed.action).into()),
+                    };
+
+                    return Ok((signal, parsed.confidence, parsed.reasoning));
+                }
+                Err(e) => {
+                    last_error = e.to_string();
+                    retry_count += 1;
+                    if retry_count >= MAX_RETRIES {
+                        return Err(anyhow::anyhow!("API request failed after {} retries: {}", MAX_RETRIES, last_error).into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create LLM prompt for ENTRY decisions (when in cash)
+    fn create_entry_prompt(&self, candles: &[Candle]) -> Result<String> {
+        use crate::indicators::{calculate_rsi, calculate_adx};
+
+        let current = candles.last().unwrap();
+        let current_price = current.close;
+
+        // Calculate technical indicators
+        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+        let rsi = calculate_rsi(&closes, 14).unwrap_or(50.0);
+
+        let adx_result = calculate_adx(candles, 14);
+        let (adx, plus_di, minus_di) = adx_result.unwrap_or((0.0, 0.0, 0.0));
+
+        // Price changes
+        let price_24h_ago = candles.get(candles.len().saturating_sub(24)).map(|c| c.close).unwrap_or(current_price);
+        let price_7d_ago = candles.get(candles.len().saturating_sub(168)).map(|c| c.close).unwrap_or(current_price);
+        let price_14d_ago = candles.get(candles.len().saturating_sub(336)).map(|c| c.close).unwrap_or(current_price);
+
+        let change_24h = ((current_price - price_24h_ago) / price_24h_ago) * 100.0;
+        let change_7d = ((current_price - price_7d_ago) / price_7d_ago) * 100.0;
+        let change_14d = ((current_price - price_14d_ago) / price_14d_ago) * 100.0;
+
+        let prompt = format!(
+            r#"You are analyzing SOL/USD for potential BUY opportunities. You are currently in CASH.
+
+**MARKET DATA:**
+- Current price: ${:.2}
+- 24H change: {:.2}%
+- 7D change: {:.2}%
+- 14D change: {:.2}%
+- RSI(14): {:.1}
+- ADX: {:.1} (+DI: {:.1}, -DI: {:.1})
+
+**DECISION: Should you BUY or WAIT?**
+
+**Buy if you see:**
+1. **Momentum building:** 7-14 day uptrend (6%+ gains), RSI 50-70, ADX >20
+2. **Oversold bounce:** RSI <30, recent sharp decline, capitulation signs
+
+**Wait if:**
+- Choppy/uncertain conditions
+- RSI overbought (>75)
+- Weak or no clear trend
+
+**OUTPUT (JSON only):**
+{{
+  "action": "Buy|Hold",
+  "confidence": 0.0-1.0,
+  "reasoning": "Brief explanation"
+}}
+
+**Important:** Only recommend Buy with 0.70+ confidence if you see a clear opportunity."#,
+            current_price,
+            change_24h,
+            change_7d,
+            change_14d,
+            rsi,
+            adx,
+            plus_di,
+            minus_di
+        );
+
+        Ok(prompt)
+    }
+
+    /// Create LLM prompt for EXIT decisions (when in position) - SIMPLE BINARY CHOICE
+    fn create_exit_prompt(&self, candles: &[Candle], position: &PositionContext) -> Result<String> {
+        use crate::indicators::{calculate_rsi, calculate_adx};
+
+        let current = candles.last().unwrap();
+        let current_price = current.close;
+        let entry_price = position.entry_price.unwrap_or(current_price);
+        let pnl = position.pnl_percent.unwrap_or(0.0);
+        let days = position.days_held.unwrap_or(0.0);
+
+        // Calculate technical indicators
+        let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+        let rsi = calculate_rsi(&closes, 14).unwrap_or(50.0);
+
+        let adx_result = calculate_adx(candles, 14);
+        let (adx, plus_di, minus_di) = adx_result.unwrap_or((0.0, 0.0, 0.0));
+
+        // Recent price action
+        let price_24h_ago = candles.get(candles.len().saturating_sub(24)).map(|c| c.close).unwrap_or(current_price);
+        let change_24h = ((current_price - price_24h_ago) / price_24h_ago) * 100.0;
+
+        // Determine trend description
+        let trend_desc = if adx > 25.0 {
+            if plus_di > minus_di {
+                "Strong uptrend"
+            } else {
+                "Strong downtrend"
+            }
+        } else if adx > 15.0 {
+            if plus_di > minus_di {
+                "Weak uptrend"
+            } else {
+                "Weak downtrend"
+            }
+        } else {
+            "No clear trend (choppy)"
+        };
+
+        let prompt = format!(
+            r#"CURRENT POSITION STATUS:
+- Entry Price: ${:.2}
+- Current Price: ${:.2}
+- P&L: {:.2}%
+- Days Held: {:.1}
+- 24H Change: {:.2}%
+- RSI: {:.1}
+- Trend: {} (ADX: {:.1})
+
+**DECISION: Should you EXIT (Sell) or HOLD?**
+
+This is a simple binary choice. Consider:
+
+**EXIT if:**
+- P&L ≤ -8% (stop loss - cut losses)
+- P&L ≥ +15% (take profit - lock in gains)
+- Held 7+ days with <5% gain (time stop - not working)
+- Clear reversal (RSI >75 overbought OR strong downtrend forming)
+
+**HOLD if:**
+- Position is working (P&L improving, trend intact)
+- No clear reason to exit
+- Still within acceptable range
+
+**Important:** Be decisive. Don't overthink this. It's a yes/no question.
+
+**OUTPUT (JSON only):**
+{{
+  "action": "Sell|Hold",
+  "confidence": 0.0-1.0,
+  "reasoning": "Brief explanation"
+}}
+
+Only recommend Sell with 0.70+ confidence if there's a clear exit reason."#,
+            entry_price,
+            current_price,
+            pnl,
+            days,
+            change_24h,
+            rsi,
+            trend_desc,
+            adx
+        );
+
+        Ok(prompt)
     }
 }

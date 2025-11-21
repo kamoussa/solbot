@@ -8,14 +8,17 @@
 use cryptobot::backtest::BacktestRunner;
 use cryptobot::models::{Candle, Signal};
 use cryptobot::persistence::RedisPersistence;
-use cryptobot::regime::{CompositeRegimeDetector, LLMRegimeDetector, LLMStrategySelector, MarketRegime, RegimeDetector, Strategy as StrategyEnum};
+use cryptobot::regime::{CompositeRegimeDetector, LLMStrategySelector, MarketRegime, RegimeDetector, Strategy as StrategyEnum, TradingSignal, PositionContext};
 use cryptobot::risk::CircuitBreakers;
 use cryptobot::strategy::buy_and_hold::BuyAndHoldStrategy;
+use cryptobot::strategy::dca::DCAStrategy;
 use cryptobot::strategy::mean_reversion::MeanReversionStrategy;
 use cryptobot::strategy::momentum::MomentumStrategy;
 use cryptobot::strategy::signals::SignalConfig;
 use cryptobot::strategy::Strategy;
 use cryptobot::Result;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Hybrid strategy that uses ADX-based regime detection
 struct RealisticHybridStrategy {
@@ -23,6 +26,7 @@ struct RealisticHybridStrategy {
     mean_reversion: MeanReversionStrategy,
     dca: BuyAndHoldStrategy,
     regime_detector: RegimeDetector,
+    regime_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl RealisticHybridStrategy {
@@ -36,7 +40,14 @@ impl RealisticHybridStrategy {
             mean_reversion,
             dca,
             regime_detector: RegimeDetector::default(),
+            regime_counts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn get_regime_stats(&self) -> (usize, HashMap<String, usize>) {
+        let counts = self.regime_counts.lock().unwrap();
+        let total: usize = counts.values().sum();
+        (total, counts.clone())
     }
 }
 
@@ -51,6 +62,10 @@ impl Strategy for RealisticHybridStrategy {
             Some(r) => r,
             None => return Ok(Signal::Hold), // Not enough data yet
         };
+
+        // Track regime
+        let regime_name = format!("{:?}", regime);
+        *self.regime_counts.lock().unwrap().entry(regime_name).or_insert(0) += 1;
 
         // Select strategy based on detected regime
         match regime {
@@ -68,9 +83,16 @@ impl Strategy for RealisticHybridStrategy {
                 }
                 self.mean_reversion.generate_signal(candles)
             }
-            MarketRegime::ChoppyUnclear | MarketRegime::ChoppyClear => {
-                // Use DCA for choppy markets (avoid whipsaws)
-                self.dca.generate_signal(candles)
+            MarketRegime::ChoppyClear => {
+                // OPTION D: Use Mean Reversion for clean ranges (clear support/resistance)
+                if candles.len() < 44 {
+                    return Ok(Signal::Hold);
+                }
+                self.mean_reversion.generate_signal(candles)
+            }
+            MarketRegime::ChoppyUnclear => {
+                // OPTION D: Stay in cash for whipsaws (no clear pattern)
+                Ok(Signal::Hold)
             }
         }
     }
@@ -136,9 +158,16 @@ impl Strategy for CompositeHybridStrategy {
                 }
                 self.mean_reversion.generate_signal(candles)
             }
-            MarketRegime::ChoppyUnclear | MarketRegime::ChoppyClear => {
-                // Use DCA for choppy markets (avoid whipsaws)
-                self.dca.generate_signal(candles)
+            MarketRegime::ChoppyClear => {
+                // OPTION D: Use Mean Reversion for clean ranges (clear support/resistance)
+                if candles.len() < 44 {
+                    return Ok(Signal::Hold);
+                }
+                self.mean_reversion.generate_signal(candles)
+            }
+            MarketRegime::ChoppyUnclear => {
+                // OPTION D: Stay in cash for whipsaws (no clear pattern)
+                Ok(Signal::Hold)
             }
         }
     }
@@ -209,8 +238,8 @@ impl Strategy for ConfidenceHybridStrategy {
                     }
                     self.momentum.generate_signal(candles)
                 } else {
-                    // Low confidence → fallback to DCA
-                    self.dca.generate_signal(candles)
+                    // Low confidence → OPTION B: stay in cash
+                    Ok(Signal::Hold)
                 }
             }
             MarketRegime::BearCrash => {
@@ -221,8 +250,8 @@ impl Strategy for ConfidenceHybridStrategy {
                     }
                     self.mean_reversion.generate_signal(candles)
                 } else {
-                    // Low confidence → fallback to DCA
-                    self.dca.generate_signal(candles)
+                    // Low confidence → OPTION B: stay in cash
+                    Ok(Signal::Hold)
                 }
             }
             MarketRegime::ChoppyUnclear | MarketRegime::ChoppyClear => {
@@ -249,101 +278,6 @@ impl Strategy for ConfidenceHybridStrategy {
 /// Sampling strategy:
 /// Anti-Thrashing Regime Tracker
 ///
-/// Prevents rapid regime switching by enforcing:
-/// - Minimum regime duration (must stay in regime for N samples)
-/// - Confidence thresholds (must be X% confident to switch)
-/// - Extra protection for trends (they persist longer than choppy markets)
-struct RegimeTracker {
-    current_regime: Option<MarketRegime>,
-    regime_start_sample: usize,  // Sample number when current regime started
-    min_duration_samples: usize,  // Don't switch for at least N samples
-    default_confidence_threshold: f64,  // Require high confidence to switch (0.85 = 85%)
-    trend_confidence_threshold: f64,    // Even higher for exiting trends (0.90 = 90%)
-    switches_count: usize,  // Track total switches for debugging
-}
-
-impl RegimeTracker {
-    fn new() -> Self {
-        Self {
-            current_regime: None,
-            regime_start_sample: 0,
-            min_duration_samples: 4,  // 4 samples × 48h = 192 hours (8 days) minimum
-            default_confidence_threshold: 0.85,  // 85% confidence required
-            trend_confidence_threshold: 0.90,     // 90% for trends
-            switches_count: 0,
-        }
-    }
-
-    /// Filter LLM's regime decision through anti-thrashing rules
-    fn should_accept_regime(
-        &mut self,
-        llm_regime: MarketRegime,
-        llm_confidence: f64,
-        current_sample: usize
-    ) -> MarketRegime {
-        // First detection - accept it
-        if self.current_regime.is_none() {
-            self.current_regime = Some(llm_regime);
-            self.regime_start_sample = current_sample;
-            println!("  🎯 REGIME TRACKER: Initial regime {:?} (confidence: {:.2})", llm_regime, llm_confidence);
-            return llm_regime;
-        }
-
-        let current = self.current_regime.unwrap();
-        let samples_in_regime = current_sample - self.regime_start_sample;
-
-        // Same regime - no change needed
-        if llm_regime == current {
-            return current;
-        }
-
-        // ANTI-THRASHING RULES:
-
-        // Rule 1: Too soon to switch (enforce minimum duration)
-        if samples_in_regime < self.min_duration_samples {
-            println!(
-                "  🚫 REGIME TRACKER: BLOCKED switch {:?} → {:?} (only {} samples, need {})",
-                current, llm_regime, samples_in_regime, self.min_duration_samples
-            );
-            return current;
-        }
-
-        // Rule 2: Not confident enough
-        if llm_confidence < self.default_confidence_threshold {
-            println!(
-                "  🚫 REGIME TRACKER: BLOCKED switch {:?} → {:?} (confidence {:.2} < {:.2})",
-                current, llm_regime, llm_confidence, self.default_confidence_threshold
-            );
-            return current;
-        }
-
-        // Rule 3: Extra protection for trends (they persist longer)
-        if matches!(current, MarketRegime::BullTrend | MarketRegime::BearCrash) {
-            if llm_confidence < self.trend_confidence_threshold {
-                println!(
-                    "  🚫 REGIME TRACKER: BLOCKED exit from trend {:?} → {:?} (confidence {:.2} < {:.2})",
-                    current, llm_regime, llm_confidence, self.trend_confidence_threshold
-                );
-                return current;  // Require 90% confidence to exit trends
-            }
-        }
-
-        // All checks passed - allow switch
-        self.switches_count += 1;
-        self.current_regime = Some(llm_regime);
-        self.regime_start_sample = current_sample;
-        println!(
-            "  ✅ REGIME TRACKER: ACCEPTED switch {:?} → {:?} (confidence: {:.2}, held for {} samples, switch #{})",
-            current, llm_regime, llm_confidence, samples_in_regime, self.switches_count
-        );
-        llm_regime
-    }
-
-    fn get_stats(&self) -> (usize, Option<MarketRegime>) {
-        (self.switches_count, self.current_regime)
-    }
-}
-
 /// Drawdown analysis result
 #[derive(Debug)]
 struct DrawdownAnalysis {
@@ -618,155 +552,6 @@ impl StrategyTracker {
 /// - Cache regime for intermediate hours
 /// - Anti-thrashing: Enforce minimum duration & confidence thresholds
 /// - Reduces 8760 calls to ~180 calls with 48h sampling
-struct LLMHybridStrategy {
-    momentum: MomentumStrategy,
-    mean_reversion: MeanReversionStrategy,
-    dca: BuyAndHoldStrategy,
-    llm_detector: std::sync::Mutex<LLMRegimeDetector>,
-    regime_tracker: std::sync::Mutex<RegimeTracker>,  // NEW: Anti-thrashing filter
-    sample_interval: usize, // Sample every N candles (based on absolute candle count)
-    call_count: std::sync::Mutex<usize>, // Track number of times generate_signal was called
-    cached_regime: std::sync::Mutex<Option<MarketRegime>>,
-    regime_log: std::sync::Mutex<Vec<(String, String, f64)>>, // (timestamp, regime, confidence)
-}
-
-impl LLMHybridStrategy {
-    fn new(
-        momentum: MomentumStrategy,
-        mean_reversion: MeanReversionStrategy,
-        dca: BuyAndHoldStrategy,
-        llm_detector: LLMRegimeDetector,
-        sample_interval: usize,
-    ) -> Self {
-        Self {
-            momentum,
-            mean_reversion,
-            dca,
-            llm_detector: std::sync::Mutex::new(llm_detector),
-            regime_tracker: std::sync::Mutex::new(RegimeTracker::new()),  // NEW: Initialize tracker
-            sample_interval,
-            call_count: std::sync::Mutex::new(0),
-            cached_regime: std::sync::Mutex::new(None),
-            regime_log: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Get regime switching statistics
-    fn get_regime_stats(&self) -> (usize, Option<MarketRegime>) {
-        self.regime_tracker.lock().unwrap().get_stats()
-    }
-
-    /// Save regime detections to file for future caching
-    fn save_regime_log(&self, path: &str) -> std::io::Result<()> {
-        use std::io::Write;
-        let log = self.regime_log.lock().unwrap();
-        let mut file = std::fs::File::create(path)?;
-        writeln!(file, "timestamp,regime,confidence")?;
-        for (ts, regime, conf) in log.iter() {
-            writeln!(file, "{},{},{:.4}", ts, regime, conf)?;
-        }
-        println!("  💾 Saved {} regime detections to {}", log.len(), path);
-        Ok(())
-    }
-}
-
-impl Strategy for LLMHybridStrategy {
-    fn generate_signal(&self, candles: &[Candle]) -> cryptobot::Result<Signal> {
-        if candles.is_empty() {
-            return Ok(Signal::Hold);
-        }
-
-        // Increment call count and check if we should sample
-        let mut call_count = self.call_count.lock().unwrap();
-        let current_call = *call_count;
-        *call_count += 1;
-        drop(call_count); // Release lock early
-
-        let should_sample = current_call % self.sample_interval == 0;
-
-        if current_call % 100 == 0 || should_sample {
-            println!(
-                "🔍 LLM DEBUG: call #{}, should_sample={}, sample_interval={}",
-                current_call, should_sample, self.sample_interval
-            );
-        }
-
-        let regime = if should_sample {
-            println!("🤖 LLM API CALL at call #{}", current_call);
-            // Time to call LLM API (must use block_in_place to avoid nested runtime error)
-            let regime_result = tokio::task::block_in_place(|| {
-                let mut detector = self.llm_detector.lock().unwrap();
-                tokio::runtime::Handle::current().block_on(async {
-                    detector.detect_regime_with_confidence(candles).await
-                })
-            });
-
-            match regime_result {
-                Ok((llm_regime, llm_confidence)) => {
-                    // Log raw LLM detection for caching
-                    let timestamp = candles.last().unwrap().timestamp.to_rfc3339();
-                    let regime_str = format!("{:?}", llm_regime);
-                    self.regime_log.lock().unwrap().push((timestamp.clone(), regime_str, llm_confidence));
-                    println!("  ✅ LLM RAW: {:?} (confidence: {:.2}) at {}", llm_regime, llm_confidence, timestamp);
-
-                    // Filter through RegimeTracker to prevent thrashing
-                    let mut tracker = self.regime_tracker.lock().unwrap();
-                    let filtered_regime = tracker.should_accept_regime(llm_regime, llm_confidence, current_call);
-                    drop(tracker); // Release lock
-
-                    // Update cached regime with FILTERED result
-                    *self.cached_regime.lock().unwrap() = Some(filtered_regime);
-
-                    filtered_regime
-                }
-                Err(e) => {
-                    println!("  ❌ LLM API ERROR: {}", e);
-                    // Fall back to cached regime or return Hold
-                    match *self.cached_regime.lock().unwrap() {
-                        Some(r) => {
-                            println!("  ↩️  Using last cached regime: {:?}", r);
-                            r
-                        }
-                        None => return Ok(Signal::Hold),
-                    }
-                }
-            }
-        } else {
-            // Use cached regime
-            match *self.cached_regime.lock().unwrap() {
-                Some(r) => r,
-                None => return Ok(Signal::Hold), // Shouldn't happen
-            }
-        };
-
-        // Select strategy based on detected regime
-        match regime {
-            MarketRegime::BullTrend => {
-                if candles.len() < 25 {
-                    return Ok(Signal::Hold);
-                }
-                self.momentum.generate_signal(candles)
-            }
-            MarketRegime::BearCrash => {
-                if candles.len() < 44 {
-                    return Ok(Signal::Hold);
-                }
-                self.mean_reversion.generate_signal(candles)
-            }
-            MarketRegime::ChoppyUnclear | MarketRegime::ChoppyClear => {
-                self.dca.generate_signal(candles)
-            }
-        }
-    }
-
-    fn name(&self) -> &str {
-        "Hybrid (LLM GPT-4)"
-    }
-
-    fn min_candles_required(&self) -> usize {
-        50 // LLM needs 50+ candles for context
-    }
-}
 
 /// Option 3: LLM Direct Strategy Selection (eliminates regime translation layer)
 ///
@@ -946,8 +731,214 @@ impl Strategy for LLMDirectStrategyHybrid {
     }
 }
 
+/// Option 4: LLM Direct Trading Signals (Buy/Sell/Hold)
+///
+/// Eliminates both the regime detection layer AND the strategy selection layer.
+/// LLM directly provides Buy/Sell/Hold signals with full position awareness.
+///
+/// Key features:
+/// - Position-aware: LLM knows if we have an open position, entry price, P&L, days held
+/// - Hard-enforced 3-day minimum hold period (enforced in code, not just prompt)
+/// - No strategy thrashing - direct trading decisions
+/// - Swing trading timeframe (1-7 day holds typical)
+struct LLMDirectTradingSignals {
+    llm_selector: std::sync::Mutex<LLMStrategySelector>,
+    sample_interval: usize,
+    min_hold_hours: usize,  // Minimum 3 days = 72 hours
+    call_count: std::sync::Mutex<usize>,
+    position_state: std::sync::Mutex<PositionState>,
+    signal_log: std::sync::Mutex<Vec<(String, String, f64, String)>>, // (timestamp, signal, confidence, reasoning)
+}
+
+#[derive(Clone)]
+struct PositionState {
+    has_position: bool,
+    entry_price: f64,
+    entry_time: usize,  // call_count when we entered
+}
+
+impl PositionState {
+    fn new() -> Self {
+        Self {
+            has_position: false,
+            entry_price: 0.0,
+            entry_time: 0,
+        }
+    }
+}
+
+impl LLMDirectTradingSignals {
+    fn new(llm_selector: LLMStrategySelector, sample_interval: usize, min_hold_hours: usize) -> Self {
+        Self {
+            llm_selector: std::sync::Mutex::new(llm_selector),
+            sample_interval,
+            min_hold_hours,
+            call_count: std::sync::Mutex::new(0),
+            position_state: std::sync::Mutex::new(PositionState::new()),
+            signal_log: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn save_signal_log(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let log = self.signal_log.lock().unwrap();
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "timestamp,signal,confidence,reasoning")?;
+        for (ts, signal, conf, reasoning) in log.iter() {
+            let escaped_reasoning = reasoning.replace("\"", "\"\"");
+            writeln!(file, "{},{},{:.4},\"{}\"", ts, signal, conf, escaped_reasoning)?;
+        }
+        println!("  💾 Saved {} trading signals to {}", log.len(), path);
+        Ok(())
+    }
+}
+
+impl Strategy for LLMDirectTradingSignals {
+    fn generate_signal(&self, candles: &[Candle]) -> cryptobot::Result<Signal> {
+        if candles.is_empty() {
+            return Ok(Signal::Hold);
+        }
+
+        // Increment call count
+        let mut call_count = self.call_count.lock().unwrap();
+        let current_call = *call_count;
+        *call_count += 1;
+        drop(call_count);
+
+        let should_sample = current_call % self.sample_interval == 0;
+
+        if current_call % 100 == 0 || should_sample {
+            println!(
+                "🔍 DIRECT TRADING LLM DEBUG: call #{}, should_sample={}, sample_interval={}",
+                current_call, should_sample, self.sample_interval
+            );
+        }
+
+        // Build position context
+        let position_state = self.position_state.lock().unwrap().clone();
+        let current_price = candles.last().unwrap().close;
+        let hours_held = if position_state.has_position {
+            current_call - position_state.entry_time
+        } else {
+            0
+        };
+        let days_held = hours_held as f64 / 24.0;
+
+        let pnl_percent = if position_state.has_position {
+            Some(((current_price - position_state.entry_price) / position_state.entry_price) * 100.0)
+        } else {
+            None
+        };
+
+        let position_context = PositionContext {
+            has_position: position_state.has_position,
+            entry_price: if position_state.has_position { Some(position_state.entry_price) } else { None },
+            current_price,
+            pnl_percent,
+            days_held: if position_state.has_position { Some(days_held) } else { None },
+        };
+
+        drop(position_state);
+
+        // Check minimum hold period BEFORE calling LLM
+        let can_sell = !position_context.has_position || hours_held >= self.min_hold_hours;
+
+        if should_sample {
+            println!("🤖 LLM API CALL (Direct Trading Signal) at call #{}", current_call);
+            println!("  📊 Position: {}, Days held: {:.1}, Can sell: {}",
+                if position_context.has_position { "LONG" } else { "CASH" },
+                position_context.days_held.unwrap_or(0.0),
+                can_sell
+            );
+
+            let signal_result = tokio::task::block_in_place(|| {
+                let mut selector = self.llm_selector.lock().unwrap();
+                tokio::runtime::Handle::current().block_on(async {
+                    selector.get_trading_signal_with_context(candles, &position_context).await
+                })
+            });
+
+            match signal_result {
+                Ok((trading_signal, confidence, reasoning)) => {
+                    let timestamp = candles.last().unwrap().timestamp.to_rfc3339();
+                    let signal_str = trading_signal.as_str().to_string();
+                    self.signal_log.lock().unwrap().push((
+                        timestamp.clone(),
+                        signal_str.clone(),
+                        confidence,
+                        reasoning.clone()
+                    ));
+
+                    println!("  ✅ LLM RAW: {:?} (confidence: {:.2})", trading_signal, confidence);
+                    if let Some(pnl) = pnl_percent {
+                        println!("      💰 Current P&L: {:.2}%", pnl);
+                    }
+                    println!("      💭 Reasoning: {}", reasoning);
+
+                    // Convert TradingSignal to Signal, enforcing min hold period
+                    let final_signal = match trading_signal {
+                        TradingSignal::Buy => {
+                            if position_context.has_position {
+                                println!("      ⚠️  Already have position, converting Buy → Hold");
+                                Signal::Hold
+                            } else {
+                                println!("      ✅ Executing Buy");
+                                // Update position state
+                                let mut pos = self.position_state.lock().unwrap();
+                                pos.has_position = true;
+                                pos.entry_price = current_price;
+                                pos.entry_time = current_call;
+                                Signal::Buy
+                            }
+                        }
+                        TradingSignal::Sell => {
+                            if !position_context.has_position {
+                                println!("      ⚠️  No position to sell, converting Sell → Hold");
+                                Signal::Hold
+                            } else if !can_sell {
+                                println!("      🚫 BLOCKED: Min hold period not met ({:.1}d < 3d), forcing Hold", days_held);
+                                Signal::Hold
+                            } else {
+                                println!("      ✅ Executing Sell (held {:.1} days)", days_held);
+                                // Update position state
+                                let mut pos = self.position_state.lock().unwrap();
+                                pos.has_position = false;
+                                pos.entry_price = 0.0;
+                                pos.entry_time = 0;
+                                Signal::Sell
+                            }
+                        }
+                        TradingSignal::Hold => Signal::Hold,
+                    };
+
+                    return Ok(final_signal);
+                }
+                Err(e) => {
+                    println!("  ❌ LLM API ERROR: {}", e);
+                    println!("  ↩️  Defaulting to Hold");
+                    return Ok(Signal::Hold);
+                }
+            }
+        }
+
+        // Not sampling - just hold
+        Ok(Signal::Hold)
+    }
+
+    fn name(&self) -> &str {
+        "LLM Direct Trading (Buy/Sell/Hold)"
+    }
+
+    fn min_candles_required(&self) -> usize {
+        50
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load .env file
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt::init();
 
     println!("\n╔═══════════════════════════════════════════════════════╗");
@@ -1011,17 +1002,29 @@ async fn main() -> Result<()> {
     println!("    Detection logic:");
     println!("      • ADX > 25 + +DI > -DI         → Momentum (bull trend)");
     println!("      • ADX > 25 + -DI > +DI + -10%  → Mean Reversion (crash)");
-    println!("      • ADX < 20                     → DCA (choppy)");
+    println!("      • ADX < 20                     → Hold/Cash (choppy)");
 
     let hybrid_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
     let hybrid_metrics =
         hybrid_runner.run(&realistic_hybrid, candles.clone(), "SOL", poll_interval, fee_rate)?;
 
+    // Print regime distribution
+    let (total_samples, regime_counts) = realistic_hybrid.get_regime_stats();
+    if total_samples > 0 {
+        println!("\n    📊 Regime Distribution ({} samples):", total_samples);
+        let mut regimes: Vec<_> = regime_counts.iter().collect();
+        regimes.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count desc
+        for (regime, count) in regimes {
+            let pct = (*count as f64 / total_samples as f64) * 100.0;
+            println!("       {} {} samples ({:.1}%)", regime, count, pct);
+        }
+    }
+
     // Test 2: Composite Hybrid (Multi-indicator regime detection)
     println!("\n  🔬 Testing Composite Hybrid with multi-indicator detection...");
     println!("    Detection logic:");
     println!("      • ATR + Volume + Structure + RSI + MA → Score-based regime");
-    println!("      • Bull: Momentum    Crash: Mean Reversion    Choppy: DCA");
+    println!("      • Bull: Momentum    Crash: Mean Reversion    Choppy: Hold/Cash");
 
     let composite_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
     let composite_metrics =
@@ -1031,10 +1034,10 @@ async fn main() -> Result<()> {
     println!("\n  🔬 Testing Confidence-based Hybrid (HIGH confidence only)...");
     println!("    Detection logic:");
     println!("      • Bull >= 5.0 confidence   → Momentum");
-    println!("      • Bull < 5.0 confidence    → DCA (fallback)");
+    println!("      • Bull < 5.0 confidence    → Hold/Cash (fallback)");
     println!("      • Crash >= 4.0 confidence  → Mean Reversion");
-    println!("      • Crash < 4.0 confidence   → DCA (fallback)");
-    println!("      • Choppy (any confidence)  → DCA");
+    println!("      • Crash < 4.0 confidence   → Hold/Cash (fallback)");
+    println!("      • Choppy (any confidence)  → Hold/Cash");
 
     let confidence_hybrid = ConfidenceHybridStrategy::new(
         momentum.clone(),
@@ -1051,58 +1054,62 @@ async fn main() -> Result<()> {
     println!("\n  ⏭️  Skipping LLM Regime-Based test (Option 1 - focusing on Option 3 only)");
     let llm_metrics: Option<cryptobot::backtest::BacktestMetrics> = None;
 
-    // Test 5: LLM Direct Strategy Selection (Option 3) - No regime translation layer
-    let llm_direct_metrics = if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-        println!("\n  🔬 Testing LLM Direct Strategy Selection (Option 3)...");
-        println!("    ✨ NEW APPROACH: No regime classification!");
-        println!("    Detection logic:");
-        println!("      • LLM directly recommends: Momentum, Mean Reversion, or DCA");
-        println!("      • Sees historical performance: DCA +1.96%, Momentum +0.38%, Mean Rev -0.05%");
-        println!("      • Moderate bias toward proven DCA strategy");
-        println!("      • Anti-thrashing: 85% confidence to switch (85% to exit DCA)");
+    // Test 5: LLM Direct Strategy Selection (Option 3) - SKIPPED to save time/credits
+    println!("\n  ⏭️  Skipping LLM Direct Strategy test (Option 3 - focusing on Option 4)");
+    let llm_direct_metrics: Option<cryptobot::backtest::BacktestMetrics> = None;
+
+    // Test 6: LLM Direct Trading Signals (Buy/Sell/Hold) - COMMENTED OUT (not performant)
+    /*
+    let llm_trading_metrics = if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        println!("\n  🔬 Testing LLM Direct Trading Signals...");
+        println!("    ✨ NEWEST APPROACH: Direct Buy/Sell/Hold signals!");
+        println!("    Features:");
+        println!("      • LLM directly provides: Buy, Sell, or Hold signals");
+        println!("      • Position-aware: Knows entry price, P&L%, days held");
+        println!("      • Hard-enforced 3-day minimum hold period");
+        println!("      • No strategy layer - direct trading decisions");
         println!("      • Samples every 48 hours");
         println!("      • Est. API calls: ~183 (~$0.33 with gpt-4o-mini)");
 
         let llm_selector = LLMStrategySelector::new_no_cache(api_key);
-        let llm_direct = LLMDirectStrategyHybrid::new(
-            momentum.clone(),
-            mean_reversion.clone(),
-            buy_and_hold.clone(),
+        let llm_trading = LLMDirectTradingSignals::new(
             llm_selector,
-            48, // Sample every 48 hours
+            48,  // Sample every 48 hours
+            72,  // 3-day minimum hold period (72 hours)
         );
 
-        let llm_direct_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
-        let metrics = llm_direct_runner.run(&llm_direct, candles.clone(), "SOL", poll_interval, fee_rate)?;
+        let llm_trading_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
+        let metrics = llm_trading_runner.run(&llm_trading, candles.clone(), "SOL", poll_interval, fee_rate)?;
 
-        // Print strategy switching statistics
-        let (switches, final_strategy) = llm_direct.get_strategy_stats();
-        println!("\n  📊 STRATEGY SWITCHING STATISTICS:");
-        println!("      • Total strategy switches: {}", switches);
-        println!("      • Final strategy: {:?}", final_strategy.unwrap_or(StrategyEnum::DCA));
-        if candles.len() > 0 {
-            let total_hours = candles.len() as f64 * (poll_interval as f64 / 60.0);
-            let avg_duration = if switches > 0 {
-                total_hours / (switches as f64 + 1.0)
-            } else {
-                total_hours
-            };
-            println!("      • Average strategy duration: {:.1}h ({:.1} days)", avg_duration, avg_duration / 24.0);
-        }
-
-        // Save strategy selections for analysis
-        llm_direct.save_strategy_log("/tmp/llm_direct_strategy_selections.csv").ok();
+        // Save trading signals for analysis
+        llm_trading.save_signal_log("/tmp/llm_direct_trading_signals.csv").ok();
 
         Some(metrics)
     } else {
-        println!("\n  ⏭️  Skipping LLM Direct Strategy test (OPENAI_API_KEY not set)");
+        println!("\n  ⏭️  Skipping LLM Direct Trading test (OPENAI_API_KEY not set)");
         None
     };
+    */
+    println!("\n  ⏭️  Skipping LLM Direct Trading test (not performant - commented out)");
+    let llm_trading_metrics: Option<cryptobot::backtest::BacktestMetrics> = None;
 
-    // Test 6: DCA baseline
-    println!("\n  🔬 Testing DCA baseline...");
+    // Test 7: Pure Buy-and-Hold baseline
+    println!("\n  🔬 Testing Pure Buy-and-Hold baseline...");
+    println!("    • Buys once at start");
+    println!("    • No automatic exits (holds forever)");
+    println!("    • True HODL strategy");
+    let pure_bnh_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
+    let pure_bnh_metrics = pure_bnh_runner.run(&buy_and_hold, candles.clone(), "SOL", poll_interval, fee_rate)?;
+
+    // Test 8: True DCA (Dollar Cost Averaging) baseline
+    println!("\n  🔬 Testing True DCA (Weekly) baseline...");
+    println!("    • Buys fixed amount every 7 days (168 hours)");
+    println!("    • Accumulates positions over time");
+    println!("    • No automatic exits (pure accumulation)");
+    println!("    • Averages entry price across purchases");
+    let dca_weekly = DCAStrategy::weekly();
     let dca_runner = BacktestRunner::new(initial_capital, circuit_breakers.clone());
-    let dca_metrics = dca_runner.run(&buy_and_hold, candles.clone(), "SOL", poll_interval, fee_rate)?;
+    let dca_metrics = dca_runner.run(&dca_weekly, candles.clone(), "SOL", poll_interval, fee_rate)?;
 
     // Test 3: Momentum only
     println!("\n  🔬 Testing Momentum only...");
@@ -1124,6 +1131,15 @@ async fn main() -> Result<()> {
     println!("────────────────────────────────────────────────────────────");
 
     // Show LLM results first if available
+    if let Some(ref llm_trading) = llm_trading_metrics {
+        println!(
+            "✨ LLM Direct Trading (Opt 4)  {:+6.2}%    {:4}     {:+.2}%",
+            llm_trading.net_return_pct,
+            llm_trading.total_trades,
+            llm_trading.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
     if let Some(ref llm_direct) = llm_direct_metrics {
         println!(
             "🚀 LLM Direct Strategy (Opt 3) {:+6.2}%    {:4}     {:+.2}%",
@@ -1183,6 +1199,14 @@ async fn main() -> Result<()> {
     println!("\n📊 COMPARISON WITH BASELINES:\n");
     println!("Perfect Hybrid (manual labels):         +3.42% (beats DCA by +1.45%)");
 
+    if let Some(ref llm_trading) = llm_trading_metrics {
+        println!(
+            "✨ LLM Direct Trading Signals (Opt 4):  {:+.2}% (vs DCA: {:+.2}%)",
+            llm_trading.net_return_pct,
+            llm_trading.net_return_pct - dca_metrics.net_return_pct
+        );
+    }
+
     if let Some(ref llm_direct) = llm_direct_metrics {
         println!(
             "🚀 LLM Direct Strategy (Option 3):      {:+.2}% (vs DCA: {:+.2}%)",
@@ -1214,7 +1238,9 @@ async fn main() -> Result<()> {
         hybrid_metrics.net_return_pct,
         hybrid_metrics.net_return_pct - dca_metrics.net_return_pct
     );
-    println!("DCA Baseline:                           {:+.2}%", dca_metrics.net_return_pct);
+    println!("\n📈 BASELINES:");
+    println!("Pure Buy-and-Hold (HODL):               {:+.2}%", pure_bnh_metrics.net_return_pct);
+    println!("True DCA (Weekly):                      {:+.2}%", dca_metrics.net_return_pct);
 
     // Verdict
     println!("\n🎯 VERDICT:");
@@ -1230,7 +1256,7 @@ async fn main() -> Result<()> {
         println!("   Trades: {} (vs DCA's {})", confidence_metrics.total_trades, dca_metrics.total_trades);
         println!("\n   Why it works:");
         println!("   • Only trades when detector has HIGH confidence (Bull≥5.0, Crash≥4.0)");
-        println!("   • Falls back to proven DCA when uncertain");
+        println!("   • Stays in cash during choppy/uncertain markets (avoids forced trades)");
         println!("   • Avoids low-confidence whipsaws that hurt regular hybrid");
         println!("\n   Recommendation: DEPLOY confidence-based hybrid strategy");
         println!("   Next steps:");

@@ -23,17 +23,19 @@ pub enum ExitReason {
 pub struct Position {
     pub id: Uuid,
     pub token: String,
-    pub entry_price: f64,
+    pub entry_price: f64,          // Average entry price for accumulated positions
     pub quantity: f64,
-    pub entry_time: DateTime<Utc>,
-    pub stop_loss: f64,           // -8% from entry
-    pub take_profit: Option<f64>, // Trailing stop
-    pub trailing_high: f64,       // Track highest price for trailing stop
+    pub entry_time: DateTime<Utc>, // First entry time
+    pub stop_loss: f64,            // -8% from (average) entry
+    pub take_profit: Option<f64>,  // Trailing stop
+    pub trailing_high: f64,        // Track highest price for trailing stop
     pub status: PositionStatus,
     pub realized_pnl: Option<f64>,
     pub exit_price: Option<f64>,
     pub exit_time: Option<DateTime<Utc>>,
     pub exit_reason: Option<ExitReason>,
+    pub allow_accumulation: bool, // If true, can add to this position (for DCA)
+    pub total_cost_basis: f64,    // Total $ invested (for tracking average price)
 }
 
 pub struct PositionManager {
@@ -105,25 +107,55 @@ impl PositionManager {
         entry_price: f64,
         quantity: f64,
     ) -> anyhow::Result<Uuid> {
-        self.open_position_at(token, entry_price, quantity, None)
+        self.open_position_at(token, entry_price, quantity, None, false)
     }
 
     /// Create new position with explicit timestamp (for backtesting)
+    ///
+    /// If `allow_accumulation` is true on an existing position, this will add to that position
+    /// instead of creating a new one (for DCA strategies).
+    ///
+    /// # Arguments
+    /// * `allow_accumulation` - If true, allows adding to this position later (for DCA)
     pub fn open_position_at(
         &mut self,
         token: String,
         entry_price: f64,
         quantity: f64,
         timestamp: Option<DateTime<Utc>>,
+        allow_accumulation: bool,
     ) -> anyhow::Result<Uuid> {
-        // Check if we already have an open position for this token
-        if self.has_open_position(&token) {
-            anyhow::bail!("Already have open position for {}", token);
+        // Check if we have an open position that allows accumulation
+        if let Some(existing_pos) = self.get_open_position(&token) {
+            if existing_pos.allow_accumulation {
+                // Add to existing position (DCA accumulation)
+                let position_id = existing_pos.id;
+                let position = self.get_position_mut(position_id)?;
+
+                // Update accumulated values
+                position.total_cost_basis += entry_price * quantity;
+                position.quantity += quantity;
+                position.entry_price = position.total_cost_basis / position.quantity; // Average price
+
+                // Update stop loss and trailing high based on new average entry
+                position.stop_loss = position.entry_price * 0.92;
+                position.trailing_high = position.trailing_high.max(entry_price);
+
+                tracing::info!(
+                    "Accumulated {} @ ${:.2} (avg: ${:.2}, total qty: {:.4})",
+                    token, entry_price, position.entry_price, position.quantity
+                );
+
+                return Ok(position_id);
+            } else {
+                anyhow::bail!("Already have open position for {}", token);
+            }
         }
 
         let id = Uuid::new_v4();
         let stop_loss = entry_price * 0.92; // -8% from entry
         let entry_time = timestamp.unwrap_or_else(Utc::now);
+        let total_cost_basis = entry_price * quantity;
 
         let position = Position {
             id,
@@ -139,6 +171,8 @@ impl PositionManager {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation, // Use the parameter
+            total_cost_basis,
         };
 
         self.positions.push(position);

@@ -5,4 +5,4 @@ pub mod strategy_selector;
 
 pub use detector::{CompositeRegimeDetector, MarketRegime, RegimeDetector};
 pub use llm_detector::{LLMRegimeDetector, LLMRegimeResponse};
-pub use strategy_selector::{LLMStrategySelector, LLMStrategyResponse, Strategy};
+pub use strategy_selector::{LLMStrategySelector, LLMStrategyResponse, Strategy, TradingSignal, PositionContext};

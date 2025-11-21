@@ -1,6 +1,6 @@
 use crate::backtest::metrics::BacktestMetrics;
 use crate::execution::{ExecutionAction, Executor, PositionManager};
-use crate::models::Candle;
+use crate::models::{Candle, Signal};
 use crate::risk::CircuitBreakers;
 use crate::strategy::Strategy;
 use crate::Result;
@@ -65,8 +65,9 @@ impl BacktestRunner {
 
         let mut executor = Executor::new(position_manager.clone());
 
-        // Track circuit breaker hits
+        // Track circuit breaker hits and accumulations
         let mut circuit_breaker_hits = 0;
+        let mut accumulation_count = 0;
 
         // Simulate main trading loop
         // Start trading once we have enough candles for the strategy
@@ -75,12 +76,22 @@ impl BacktestRunner {
             let current_candle = &candles[i];
             let current_price = current_candle.close;
 
+            // Debug logging for accumulation strategies
+            if strategy.supports_accumulation() && i % 100 == 0 {
+                tracing::debug!(
+                    "Backtest progress: iteration {}/{}, timestamp: {}",
+                    i,
+                    candles.len(),
+                    current_candle.timestamp
+                );
+            }
+
             // Create price map for position manager
             let mut prices = HashMap::new();
             prices.insert(token_symbol.to_string(), current_price);
 
-            // Check for exit conditions on existing positions FIRST
-            {
+            // Check for exit conditions on existing positions FIRST (unless strategy skips them)
+            if !strategy.skip_automatic_exits() {
                 let mut pm = position_manager.lock().unwrap();
                 if let Ok(closed_ids) = pm.check_exits_at(&prices, Some(current_candle.timestamp)) {
                     if !closed_ids.is_empty() {
@@ -96,55 +107,101 @@ impl BacktestRunner {
             // Generate signal
             match strategy.generate_signal(lookback_candles) {
                 Ok(signal) => {
-                    // Process signal with executor
-                    match executor.process_signal(&signal, token_symbol, current_price) {
-                        Ok(decision) => {
-                            match decision.action {
-                                ExecutionAction::Execute { quantity } => {
-                                    // Open position with candle timestamp for accurate backtesting
-                                    let mut pm = position_manager.lock().unwrap();
-                                    match pm.open_position_at(
-                                        token_symbol.to_string(),
-                                        current_price,
-                                        quantity,
-                                        Some(current_candle.timestamp),
-                                    ) {
-                                        Ok(_) => {
-                                            tracing::debug!(
-                                                "Opened position @ ${:.4} qty: {:.4} at {}",
-                                                current_price,
-                                                quantity,
-                                                current_candle.timestamp
-                                            );
-                                        }
-                                        Err(e) => {
-                                            if e.to_string().contains("Circuit breaker") {
-                                                circuit_breaker_hits += 1;
-                                                tracing::debug!("Circuit breaker triggered: {}", e);
-                                            }
-                                        }
-                                    }
-                                }
-                                ExecutionAction::Close {
-                                    position_id,
-                                    exit_reason,
-                                } => {
-                                    // Close position with candle timestamp for accurate backtesting
-                                    let mut pm = position_manager.lock().unwrap();
-                                    let _ = pm.close_position_at(
-                                        position_id,
-                                        current_price,
-                                        exit_reason,
-                                        Some(current_candle.timestamp),
-                                    );
-                                }
-                                ExecutionAction::Skip => {
-                                    // Do nothing
+                    // Special handling for strategies that support accumulation (like DCA)
+                    // These strategies can make multiple buys without going through the executor's
+                    // "already have position" check
+                    if matches!(signal, Signal::Buy) && strategy.supports_accumulation() {
+                        let mut pm = position_manager.lock().unwrap();
+
+                        // Calculate position size using same logic as Executor
+                        let max_position_pct = pm.circuit_breakers().max_position_size_pct;
+                        let mut prices = HashMap::new();
+                        prices.insert(token_symbol.to_string(), current_price);
+                        let portfolio_value = pm.portfolio_value(&prices).unwrap_or(self.initial_portfolio_value);
+
+                        let position_value = portfolio_value * max_position_pct;
+                        let quantity = position_value / current_price;
+
+                        match pm.open_position_at(
+                            token_symbol.to_string(),
+                            current_price,
+                            quantity,
+                            Some(current_candle.timestamp),
+                            true, // allow_accumulation
+                        ) {
+                            Ok(_) => {
+                                accumulation_count += 1;
+                                tracing::info!(
+                                    "✅ DCA: Opened/accumulated position @ ${:.4} qty: {:.4} at {}",
+                                    current_price,
+                                    quantity,
+                                    current_candle.timestamp
+                                );
+                            }
+                            Err(e) => {
+                                if e.to_string().contains("Circuit breaker") {
+                                    circuit_breaker_hits += 1;
+                                    tracing::warn!("❌ Circuit breaker blocked DCA trade: {}", e);
+                                } else {
+                                    tracing::warn!("❌ DCA trade failed: {}", e);
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!("Failed to process signal: {}", e);
+                    } else {
+                        // Normal flow: process signal with executor
+                        match executor.process_signal(&signal, token_symbol, current_price) {
+                            Ok(decision) => {
+                                match decision.action {
+                                    ExecutionAction::Execute { quantity } => {
+                                        // Open position with candle timestamp for accurate backtesting
+                                        let mut pm = position_manager.lock().unwrap();
+                                        match pm.open_position_at(
+                                            token_symbol.to_string(),
+                                            current_price,
+                                            quantity,
+                                            Some(current_candle.timestamp),
+                                            strategy.supports_accumulation(),
+                                        ) {
+                                            Ok(_) => {
+                                                if strategy.supports_accumulation() {
+                                                    accumulation_count += 1;
+                                                }
+                                                tracing::debug!(
+                                                    "Opened position @ ${:.4} qty: {:.4} at {}",
+                                                    current_price,
+                                                    quantity,
+                                                    current_candle.timestamp
+                                                );
+                                            }
+                                            Err(e) => {
+                                                if e.to_string().contains("Circuit breaker") {
+                                                    circuit_breaker_hits += 1;
+                                                    tracing::debug!("Circuit breaker triggered: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ExecutionAction::Close {
+                                        position_id,
+                                        exit_reason,
+                                    } => {
+                                        // Close position with candle timestamp for accurate backtesting
+                                        let mut pm = position_manager.lock().unwrap();
+                                        let _ = pm.close_position_at(
+                                            position_id,
+                                            current_price,
+                                            exit_reason,
+                                            Some(current_candle.timestamp),
+                                        );
+                                    }
+                                    ExecutionAction::Skip => {
+                                        // Do nothing
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to process signal: {}", e);
+                            }
                         }
                     }
                 }
@@ -186,6 +243,7 @@ impl BacktestRunner {
             final_portfolio_value,
             circuit_breaker_hits,
             transaction_cost_pct,
+            accumulation_count,
         );
 
         tracing::info!(

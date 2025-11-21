@@ -60,6 +60,7 @@ pub struct BacktestMetrics {
     pub winning_trades: usize,
     pub losing_trades: usize,
     pub win_rate: f64,
+    pub accumulation_count: usize,  // Number of position accumulations (for DCA strategies)
 
     // P&L Distribution
     pub avg_win: f64,
@@ -98,6 +99,7 @@ impl BacktestMetrics {
         final_portfolio_value: f64,
         circuit_breaker_hits: usize,
         transaction_cost_pct: f64,  // Round-trip cost as percentage (e.g., 0.01 = 1%)
+        accumulation_count: usize,  // Number of position accumulations (for DCA strategies)
     ) -> Self {
         let trades: Vec<TradeRecord> = positions
             .iter()
@@ -212,6 +214,7 @@ impl BacktestMetrics {
             winning_trades: winning_count,
             losing_trades: losing_count,
             win_rate,
+            accumulation_count,
             avg_win,
             avg_loss,
             largest_win,
@@ -246,6 +249,7 @@ impl BacktestMetrics {
             winning_trades: 0,
             losing_trades: 0,
             win_rate: 0.0,
+            accumulation_count: 0,
             avg_win: 0.0,
             avg_loss: 0.0,
             largest_win: 0.0,
@@ -353,6 +357,9 @@ impl BacktestMetrics {
 
         println!("\n📈 TRADE STATISTICS");
         println!("  Total Trades:          {}", self.total_trades);
+        if self.accumulation_count > 0 {
+            println!("  Accumulations:         {} (DCA/accumulation strategy)", self.accumulation_count);
+        }
         println!(
             "  Winning Trades:        {} ({:.1}%)",
             self.winning_trades, self.win_rate
@@ -429,6 +436,8 @@ mod tests {
             exit_price: Some(exit_price),
             exit_time: Some(exit_time),
             exit_reason: Some(crate::execution::ExitReason::TakeProfit),
+            allow_accumulation: false,
+            total_cost_basis: entry_price * quantity,
         }
     }
 
@@ -440,7 +449,7 @@ mod tests {
             create_test_position(-30.0, 90), // $30 loss
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10120.0, 0, 0.0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10120.0, 0, 0.0, 0);
 
         assert_eq!(metrics.total_trades, 3);
         assert_eq!(metrics.winning_trades, 2);
@@ -452,7 +461,7 @@ mod tests {
     #[test]
     fn test_metrics_with_no_trades() {
         let positions = vec![];
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10000.0, 0, 0.0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10000.0, 0, 0.0, 0);
 
         assert_eq!(metrics.total_trades, 0);
         assert_eq!(metrics.win_rate, 0.0);
@@ -467,7 +476,7 @@ mod tests {
             create_test_position(-50.0, 60), // $50 loss
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10250.0, 0, 0.0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 10250.0, 0, 0.0, 0);
 
         // Profit factor = Total wins / Total losses = 300 / 50 = 6.0
         assert!((metrics.profit_factor - 6.0).abs() < 0.01);
@@ -481,7 +490,7 @@ mod tests {
             create_test_position(50.0, 60),   // Back to 9950
         ];
 
-        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 9950.0, 0, 0.0);
+        let metrics = BacktestMetrics::from_positions(positions, 10000.0, 9950.0, 0, 0.0, 0);
 
         assert!((metrics.max_drawdown - 200.0).abs() < 0.01);
     }

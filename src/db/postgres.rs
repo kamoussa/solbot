@@ -154,11 +154,14 @@ impl PostgresPersistence {
                 _ => return Err("Invalid exit reason".into()),
             };
 
+            let entry_price_f64: f64 = entry_price.to_string().parse()?;
+            let quantity_f64: f64 = quantity.to_string().parse()?;
+
             positions.push(Position {
                 id,
                 token,
-                entry_price: entry_price.to_string().parse()?,
-                quantity: quantity.to_string().parse()?,
+                entry_price: entry_price_f64,
+                quantity: quantity_f64,
                 entry_time,
                 stop_loss: stop_loss.to_string().parse()?,
                 take_profit: take_profit.map(|v| v.to_string().parse()).transpose()?,
@@ -168,6 +171,8 @@ impl PostgresPersistence {
                 exit_price: exit_price.map(|v| v.to_string().parse()).transpose()?,
                 exit_time,
                 exit_reason,
+                allow_accumulation: false, // Default for legacy positions
+                total_cost_basis: entry_price_f64 * quantity_f64, // Calculate from existing data
             });
         }
 
@@ -228,11 +233,14 @@ impl PostgresPersistence {
                 _ => return Err("Invalid exit reason".into()),
             };
 
+            let entry_price_f64: f64 = entry_price.to_string().parse()?;
+            let quantity_f64: f64 = quantity.to_string().parse()?;
+
             positions.push(Position {
                 id,
                 token,
-                entry_price: entry_price.to_string().parse()?,
-                quantity: quantity.to_string().parse()?,
+                entry_price: entry_price_f64,
+                quantity: quantity_f64,
                 entry_time,
                 stop_loss: stop_loss.to_string().parse()?,
                 take_profit: take_profit.map(|v| v.to_string().parse()).transpose()?,
@@ -242,6 +250,8 @@ impl PostgresPersistence {
                 exit_price: exit_price.map(|v| v.to_string().parse()).transpose()?,
                 exit_time,
                 exit_reason,
+                allow_accumulation: false, // Default for legacy positions
+                total_cost_basis: entry_price_f64 * quantity_f64, // Calculate from existing data
             });
         }
 
@@ -536,6 +546,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 2.0,
         };
 
         db.save_position(&position).await.unwrap();
@@ -569,6 +581,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 2.0,
         };
 
         let pos2 = Position {
@@ -585,6 +599,8 @@ mod tests {
             exit_price: Some(1.20),
             exit_time: Some(Utc::now()),
             exit_reason: Some(ExitReason::TakeProfit),
+            allow_accumulation: false,
+            total_cost_basis: 1.0 * 100.0,
         };
 
         db.save_position(&pos1).await.unwrap();
@@ -620,6 +636,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 2.0,
         };
 
         db.save_position(&position).await.unwrap();
@@ -661,6 +679,8 @@ mod tests {
             exit_price: Some(110.0),
             exit_time: Some(Utc::now() - chrono::Duration::days(9)),
             exit_reason: Some(ExitReason::TakeProfit),
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 1.0,
         };
 
         let recent_position = Position {
@@ -677,6 +697,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 1.0,
         };
 
         db.save_position(&old_position).await.unwrap();
@@ -712,6 +734,8 @@ mod tests {
             exit_price: Some(110.0),
             exit_time: Some(Utc::now()),
             exit_reason: Some(ExitReason::TakeProfit),
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 2.0,
         };
 
         let pos2 = Position {
@@ -728,6 +752,8 @@ mod tests {
             exit_price: Some(0.92),
             exit_time: Some(Utc::now()),
             exit_reason: Some(ExitReason::StopLoss),
+            allow_accumulation: false,
+            total_cost_basis: 1.0 * 100.0,
         };
 
         db.save_position(&pos1).await.unwrap();
@@ -859,6 +885,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 10.0,
         };
         db.save_position(&position).await.unwrap();
 
@@ -980,6 +1008,8 @@ mod tests {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation: false,
+            total_cost_basis: 100.0 * 10.0,
         };
         db.save_position(&position).await.unwrap();
 
