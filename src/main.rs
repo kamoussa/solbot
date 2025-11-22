@@ -58,6 +58,14 @@ enum Commands {
         /// Force overwrite existing data
         #[arg(short, long)]
         force: bool,
+
+        /// Use range API for chunked backfill (better for 90+ days)
+        #[arg(long)]
+        chunked: bool,
+
+        /// Chunk size in days when using chunked mode (default: 90)
+        #[arg(long, default_value = "90")]
+        chunk_size: u32,
     },
 }
 
@@ -109,7 +117,9 @@ async fn main() -> Result<()> {
             address,
             days,
             force,
-        }) => run_backfill(&symbol, &address, days, force).await,
+            chunked,
+            chunk_size,
+        }) => run_backfill(&symbol, &address, days, force, chunked, chunk_size).await,
         None => run_bot().await,
     }
 }
@@ -268,7 +278,7 @@ async fn connect_to_postgres() -> Option<PostgresPersistence> {
     }
 }
 
-async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Result<()> {
+async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool, chunked: bool, chunk_size: u32) -> Result<()> {
     tracing::info!(
         "📥 Backfill Mode: {} ({}) for {} days",
         symbol,
@@ -277,6 +287,9 @@ async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Re
     );
     if force {
         tracing::info!("  Force mode: will overwrite existing data");
+    }
+    if chunked {
+        tracing::info!("  Chunked mode: using {}-day chunks with range API", chunk_size);
     }
 
     // Get required environment variables
@@ -293,20 +306,163 @@ async fn run_backfill(symbol: &str, address: &str, days: u32, force: bool) -> Re
     tracing::info!("🔄 Connecting to Redis at {}...", redis_url);
     let mut redis = RedisPersistence::new(&redis_url).await?;
 
-    // Run backfill
-    let stats = backfill_token(symbol, address, days, force, &coingecko, &mut redis).await?;
+    if chunked {
+        // Chunked backfill using range API
+        run_chunked_backfill(symbol, address, days, chunk_size, force, &coingecko, &mut redis).await
+    } else {
+        // Standard backfill
+        let stats = backfill_token(symbol, address, days, force, &coingecko, &mut redis).await?;
 
-    // Print results
-    tracing::info!("\n📊 Backfill Results:");
-    tracing::info!("  Fetched data points: {}", stats.fetched_points);
-    tracing::info!("  Converted candles: {}", stats.converted_candles);
-    tracing::info!("  Skipped existing: {}", stats.skipped_existing);
-    tracing::info!("  Stored new: {}", stats.stored_new);
-    tracing::info!("  Validation failures: {}", stats.validation_failures);
+        // Print results
+        tracing::info!("\n📊 Backfill Results:");
+        tracing::info!("  Fetched data points: {}", stats.fetched_points);
+        tracing::info!("  Converted candles: {}", stats.converted_candles);
+        tracing::info!("  Skipped existing: {}", stats.skipped_existing);
+        tracing::info!("  Stored new: {}", stats.stored_new);
+        tracing::info!("  Validation failures: {}", stats.validation_failures);
 
-    if stats.stored_new > 0 {
-        tracing::info!("\n✅ Backfill complete!");
-    } else if stats.skipped_existing > 0 {
+        if stats.stored_new > 0 {
+            tracing::info!("\n✅ Backfill complete!");
+        } else if stats.skipped_existing > 0 {
+            tracing::info!("\n✅ All data already present, nothing to backfill");
+        } else {
+            tracing::warn!("\n⚠️  No data was stored");
+        }
+
+        Ok(())
+    }
+}
+
+async fn run_chunked_backfill(
+    symbol: &str,
+    address: &str,
+    total_days: u32,
+    chunk_size: u32,
+    force: bool,
+    coingecko: &CoinGeckoClient,
+    redis: &mut RedisPersistence,
+) -> Result<()> {
+    use chrono::Utc;
+
+    tracing::info!("\n🔄 Starting chunked backfill for {} ({} days in {}-day chunks)...", symbol, total_days, chunk_size);
+
+    // Find CoinGecko coin_id
+    let coin_id = coingecko.find_coin_id(symbol, address).await?;
+    tracing::info!("  Found coin_id: {}", coin_id);
+
+    // Calculate chunks (working backwards from now)
+    let now = Utc::now().timestamp();
+    let mut chunks = Vec::new();
+    let mut remaining_days = total_days;
+    let mut current_end = now;
+
+    while remaining_days > 0 {
+        let chunk_days = remaining_days.min(chunk_size);
+        let chunk_start = current_end - (chunk_days as i64 * 24 * 60 * 60);
+        chunks.push((chunk_start, current_end, chunk_days));
+        current_end = chunk_start;
+        remaining_days = remaining_days.saturating_sub(chunk_size);
+    }
+
+    chunks.reverse(); // Process oldest to newest
+
+    tracing::info!("  Split into {} chunks", chunks.len());
+
+    let mut total_stats = cryptobot::backfill::BackfillStats {
+        fetched_points: 0,
+        converted_candles: 0,
+        skipped_existing: 0,
+        stored_new: 0,
+        validation_failures: 0,
+    };
+
+    for (i, (from_ts, to_ts, chunk_days)) in chunks.iter().enumerate() {
+        tracing::info!("\n  📦 Chunk {}/{}: {} days (from {} to {})",
+            i + 1, chunks.len(), chunk_days,
+            chrono::DateTime::from_timestamp(*from_ts, 0).unwrap().format("%Y-%m-%d"),
+            chrono::DateTime::from_timestamp(*to_ts, 0).unwrap().format("%Y-%m-%d")
+        );
+
+        // Fetch data for this chunk using range API
+        let market_data = coingecko.get_market_chart_range(&coin_id, *from_ts, *to_ts).await?;
+        let fetched_count = market_data.prices.len();
+        tracing::info!("    Fetched {} price points", fetched_count);
+
+        // Convert to candles (hourly for ranges within 365 days)
+        let converter = cryptobot::backfill::CandleConverter::for_hourly();
+        let candles = converter.convert_to_candles(symbol, market_data)?;
+        tracing::info!("    Converted to {} hourly candles", candles.len());
+
+        // Get existing timestamps for overlap detection
+        let existing_timestamps = if !force {
+            redis.load_candles(symbol, *chunk_days as u64 * 24)
+                .await?
+                .into_iter()
+                .map(|c| c.timestamp)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Validate and filter candles
+        let validator = cryptobot::backfill::CandleValidator::new();
+        let mut candles_to_store = Vec::new();
+        let mut chunk_skipped = 0;
+        let mut chunk_failed = 0;
+
+        for candle in candles {
+            // Validate
+            if let Err(e) = validator.validate(&candle) {
+                tracing::warn!("Validation failed for candle at {}: {}", candle.timestamp, e);
+                chunk_failed += 1;
+                continue;
+            }
+
+            // Check for overlap
+            if !force {
+                let is_duplicate = existing_timestamps
+                    .iter()
+                    .any(|&ts| (candle.timestamp - ts).num_seconds().abs() < 60);
+
+                if is_duplicate {
+                    chunk_skipped += 1;
+                    continue;
+                }
+            }
+
+            candles_to_store.push(candle);
+        }
+
+        // Store candles
+        let chunk_stored = if !candles_to_store.is_empty() {
+            redis.save_candles(symbol, &candles_to_store).await?;
+            candles_to_store.len()
+        } else {
+            0
+        };
+
+        tracing::info!("    ✓ Stored {} new candles (skipped {}, failed validation {})",
+            chunk_stored, chunk_skipped, chunk_failed);
+
+        // Aggregate stats
+        total_stats.fetched_points += fetched_count;
+        total_stats.converted_candles += candles_to_store.len() + chunk_skipped + chunk_failed;
+        total_stats.skipped_existing += chunk_skipped;
+        total_stats.stored_new += chunk_stored;
+        total_stats.validation_failures += chunk_failed;
+    }
+
+    // Print final results
+    tracing::info!("\n📊 Total Backfill Results:");
+    tracing::info!("  Fetched data points: {}", total_stats.fetched_points);
+    tracing::info!("  Converted candles: {}", total_stats.converted_candles);
+    tracing::info!("  Skipped existing: {}", total_stats.skipped_existing);
+    tracing::info!("  Stored new: {}", total_stats.stored_new);
+    tracing::info!("  Validation failures: {}", total_stats.validation_failures);
+
+    if total_stats.stored_new > 0 {
+        tracing::info!("\n✅ Chunked backfill complete!");
+    } else if total_stats.skipped_existing > 0 {
         tracing::info!("\n✅ All data already present, nothing to backfill");
     } else {
         tracing::warn!("\n⚠️  No data was stored");
@@ -807,8 +963,10 @@ async fn trading_execution_loop(
         None
     };
 
-    let strategy = MomentumStrategy::default().with_poll_interval(POLL_INTERVAL_MINUTES);
-    let samples_needed = strategy.samples_needed(POLL_INTERVAL_MINUTES);
+    // We'll create strategies per-token with their specific RSI thresholds
+    // Default strategy is used for samples_needed calculation
+    let default_strategy = MomentumStrategy::default().with_poll_interval(POLL_INTERVAL_MINUTES);
+    let samples_needed = default_strategy.samples_needed(POLL_INTERVAL_MINUTES);
     let mut executor = Executor::new(state.position_manager.clone());
 
     // Create interval starting 30 seconds after next 5-minute boundary
@@ -830,8 +988,25 @@ async fn trading_execution_loop(
 
         // Load candles from Redis for all tokens
         for token in &tokens {
+            // Load per-token RSI threshold from database
+            let rsi_threshold = if let Some(ref pg) = postgres {
+                pg.get_rsi_threshold(&token.symbol).await.unwrap_or(45.0)
+            } else {
+                45.0 // Default if no database
+            };
+
+            // Create token-specific strategy with its optimal RSI threshold
+            let token_strategy = {
+                use cryptobot::strategy::signals::SignalConfig;
+                let config = SignalConfig {
+                    rsi_oversold: rsi_threshold,
+                    ..Default::default()
+                };
+                MomentumStrategy::new(config).with_poll_interval(POLL_INTERVAL_MINUTES)
+            };
+
             match redis
-                .load_candles(&token.symbol, strategy.lookback_hours())
+                .load_candles(&token.symbol, token_strategy.lookback_hours())
                 .await
             {
                 Ok(candles) => {
@@ -850,16 +1025,17 @@ async fn trading_execution_loop(
                         prices.insert(token.symbol.clone(), latest.close);
 
                         tracing::info!(
-                            "  {} @ ${:.4} ({} candles)",
+                            "  {} @ ${:.4} ({} candles, RSI < {:.0})",
                             token.symbol,
                             latest.close,
-                            candles.len()
+                            candles.len(),
+                            rsi_threshold
                         );
 
                         // Generate signals if we have enough data
                         if candles.len() >= samples_needed {
                             process_token_signal(
-                                &strategy,
+                                &token_strategy,
                                 token,
                                 &candles,
                                 latest.close,
@@ -979,6 +1155,10 @@ async fn token_discovery_loop(
                 // This will reactivate tokens that were previously stale/removed if they're trending again
                 if let Some(mut pg) = postgres {
                     save_tracked_tokens_to_db(&mut pg, &final_tokens).await;
+
+                    // Calculate optimal RSI thresholds for tokens that need it
+                    // (new tokens or tokens with sufficient data that haven't been tuned yet)
+                    tune_rsi_for_new_tokens(&pg, &final_tokens, &redis_url).await;
                 }
 
                 // Update shared token list
@@ -1185,6 +1365,138 @@ async fn spawn_backfill_tasks(
             }
         });
     }
+}
+
+// ============================================================================
+// RSI Threshold Calculation
+// ============================================================================
+
+/// Tune RSI thresholds for newly discovered tokens with sufficient data
+async fn tune_rsi_for_new_tokens(
+    postgres: &PostgresPersistence,
+    tokens: &[TrendingToken],
+    redis_url: &str,
+) {
+    // Connect to Redis
+    let mut redis = match RedisPersistence::new(redis_url).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to connect to Redis for RSI tuning: {}", e);
+            return;
+        }
+    };
+
+    for token in tokens {
+        // Check if token already has a non-default threshold
+        match postgres.get_rsi_threshold(&token.symbol).await {
+            Ok(threshold) if (threshold - 45.0).abs() < 0.1 => {
+                // Has default threshold (45.0), needs tuning
+                tracing::debug!("{} has default RSI threshold, checking for tuning", token.symbol);
+            }
+            Ok(_) => {
+                // Already has custom threshold, skip
+                continue;
+            }
+            Err(_) => {
+                // Error loading, skip
+                continue;
+            }
+        }
+
+        // Calculate optimal threshold
+        let optimal_threshold = calculate_optimal_rsi_threshold(&token.symbol, &mut redis).await;
+
+        // Only update if different from default
+        if (optimal_threshold - 45.0).abs() > 0.1 {
+            if let Err(e) = postgres
+                .update_rsi_threshold(&token.symbol, optimal_threshold)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to save RSI threshold for {}: {}",
+                    token.symbol,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "  ✓ {} - Saved optimal RSI < {:.0}",
+                    token.symbol,
+                    optimal_threshold
+                );
+            }
+        }
+    }
+}
+
+/// Calculate optimal RSI threshold for a newly discovered token
+/// Returns the best threshold based on backtest or default 45.0 if insufficient data
+async fn calculate_optimal_rsi_threshold(
+    symbol: &str,
+    redis: &mut RedisPersistence,
+) -> f64 {
+    const MIN_CANDLES_FOR_TUNING: usize = 500; // Need ~2 days of 5-min data minimum
+    const RSI_THRESHOLDS: [f64; 5] = [30.0, 35.0, 40.0, 45.0, 50.0];
+
+    // Load available candles
+    let candles = match redis.load_candles(symbol, MIN_CANDLES_FOR_TUNING as u64).await {
+        Ok(c) if c.len() >= MIN_CANDLES_FOR_TUNING => c,
+        _ => {
+            tracing::info!(
+                "  ⚙️  {} - Insufficient data for RSI tuning, using default 45.0",
+                symbol
+            );
+            return 45.0;
+        }
+    };
+
+    tracing::info!(
+        "  ⚙️  {} - Running RSI parameter sweep ({} candles)...",
+        symbol,
+        candles.len()
+    );
+
+    use cryptobot::backtest::BacktestRunner;
+    use cryptobot::risk::CircuitBreakers;
+    use cryptobot::strategy::signals::SignalConfig;
+
+    let mut best_return = f64::NEG_INFINITY;
+    let mut best_threshold = 45.0;
+
+    for &rsi_threshold in &RSI_THRESHOLDS {
+        let config = SignalConfig {
+            rsi_period: 14,
+            rsi_oversold: rsi_threshold,
+            rsi_overbought: 70.0,
+            short_ma_period: 10,
+            long_ma_period: 20,
+            volume_threshold: 1.5,
+            lookback_hours: 24,
+            enable_panic_buy: true,
+            panic_rsi_threshold: 30.0,
+            panic_volume_multiplier: 2.0,
+            panic_price_drop_pct: 8.0,
+            panic_drop_window_candles: 12,
+        };
+
+        let strategy = MomentumStrategy::new(config).with_poll_interval(5);
+        let runner = BacktestRunner::new(10000.0, CircuitBreakers::default());
+
+        if let Ok(metrics) = runner.run(&strategy, candles.clone(), symbol, 5, 0.0) {
+            if metrics.total_return_pct > best_return {
+                best_return = metrics.total_return_pct;
+                best_threshold = rsi_threshold;
+            }
+        }
+    }
+
+    tracing::info!(
+        "  ✓ {} - Optimal RSI < {:.0} ({:+.2}% backtest return)",
+        symbol,
+        best_threshold,
+        best_return
+    );
+
+    best_threshold
 }
 
 // ============================================================================

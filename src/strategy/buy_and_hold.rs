@@ -52,6 +52,10 @@ impl Strategy for BuyAndHoldStrategy {
     fn lookback_hours(&self) -> u64 {
         0 // No lookback needed
     }
+
+    fn skip_automatic_exits(&self) -> bool {
+        true // Pure buy-and-hold: no forced exits, hold forever
+    }
 }
 
 #[cfg(test)]

@@ -137,6 +137,99 @@ impl RedisPersistence {
         let count: usize = self.conn.zcard(&key).await?;
         Ok(count)
     }
+
+    /// Load ALL candles from Redis (for backtesting historical data)
+    ///
+    /// Unlike `load_candles()`, this method:
+    /// - Loads ALL historical candles without time filtering
+    /// - Deserializes as full Candle objects (OHLCV format)
+    /// - Designed for importing and backtesting historical CSV data
+    ///
+    /// # Arguments
+    /// * `token` - Token symbol
+    ///
+    /// # Returns
+    /// Vec of candles sorted by timestamp (oldest first)
+    pub async fn load_all_candles(&mut self, token: &str) -> Result<Vec<Candle>> {
+        let key = format!("snapshots:{}", token);
+
+        // Get all snapshots without time filtering
+        let results: Vec<String> = self.conn.zrange(&key, 0, -1).await?;
+
+        let mut candles = Vec::new();
+
+        for json_str in results {
+            // Try to parse as full Candle object first (from CSV import)
+            #[derive(Deserialize)]
+            struct FullCandle {
+                open: f64,
+                high: f64,
+                low: f64,
+                close: f64,
+                volume: f64,
+                timestamp: String,
+            }
+
+            match serde_json::from_str::<FullCandle>(&json_str) {
+                Ok(full_candle) => {
+                    // Parse timestamp string (format: "2021-01-01 00:00:00 UTC")
+                    // Strip " UTC" suffix and parse as naive datetime, then convert to UTC
+                    let timestamp_str = full_candle.timestamp.trim_end_matches(" UTC");
+                    let timestamp = match chrono::NaiveDateTime::parse_from_str(
+                        timestamp_str,
+                        "%Y-%m-%d %H:%M:%S",
+                    ) {
+                        Ok(naive_dt) => DateTime::<Utc>::from_utc(naive_dt, Utc),
+                        Err(e) => {
+                            tracing::warn!("Failed to parse timestamp '{}': {}", full_candle.timestamp, e);
+                            continue;
+                        }
+                    };
+
+                    candles.push(Candle {
+                        token: token.to_string(),
+                        timestamp,
+                        open: full_candle.open,
+                        high: full_candle.high,
+                        low: full_candle.low,
+                        close: full_candle.close,
+                        volume: full_candle.volume,
+                    });
+                }
+                Err(_) => {
+                    // Fall back to StoredSnapshot format (from live data)
+                    match serde_json::from_str::<StoredSnapshot>(&json_str) {
+                        Ok(snapshot) => {
+                            candles.push(Candle {
+                                token: token.to_string(),
+                                timestamp: snapshot.timestamp,
+                                open: snapshot.price,
+                                high: snapshot.price,
+                                low: snapshot.price,
+                                close: snapshot.price,
+                                volume: snapshot.volume,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse candle: {} - {}", json_str, e);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by timestamp (oldest first) to ensure proper ordering
+        candles.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        tracing::info!(
+            "Loaded {} historical candles for {} from Redis (all time)",
+            candles.len(),
+            token
+        );
+
+        Ok(candles)
+    }
 }
 
 #[cfg(test)]

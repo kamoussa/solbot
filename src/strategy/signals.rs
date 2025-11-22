@@ -129,6 +129,13 @@ pub fn analyze_market_conditions(
     let short_ma = calculate_sma(prices, config.short_ma_period)?;
     let long_ma = calculate_sma(prices, config.long_ma_period)?;
 
+    // Calculate previous RSI to detect crossover (RSI crossing above threshold)
+    let prev_rsi = if prices.len() > 1 {
+        calculate_rsi(&prices[..prices.len() - 1], config.rsi_period)
+    } else {
+        None
+    };
+
     // Calculate volume conditions
     let current_volume = volumes.last()?;
 
@@ -149,14 +156,14 @@ pub fn analyze_market_conditions(
     let current_price = prices.last()?;
 
     // Log if we're operating without volume data
-    if !has_volume_data {
-        let zero_count = volumes.iter().filter(|&&v| v <= 0.1).count();
-        tracing::warn!(
-            "⚠️  Incomplete volume data ({}/{} candles missing volume), trading without volume confirmation. \
-             This is likely CoinGecko backfilled data - volume analysis will activate after 24h of Birdeye data.",
-            zero_count, volumes.len()
-        );
-    }
+    //if !has_volume_data {
+    //    let zero_count = volumes.iter().filter(|&&v| v <= 0.1).count();
+    //    tracing::warn!(
+    //        "⚠️  Incomplete volume data ({}/{} candles missing volume), trading without volume confirmation. \
+    //         This is likely CoinGecko backfilled data - volume analysis will activate after 24h of Birdeye data.",
+    //        zero_count, volumes.len()
+    //    );
+    //}
 
     // ==================== PANIC BUY LOGIC ====================
     // Check for flash crash conditions (aggressive entry, bypasses MA confirmation)
@@ -207,33 +214,85 @@ pub fn analyze_market_conditions(
         volume_ratio
     );
 
+    // ==================== PRICE EXTENSION FILTER ====================
+    // Don't buy if price already extended >15% in last 5 days (avoid exhaustion entries)
+    // Calculate "5 days" based on available data (hourly = 120 candles, 5min = 1440 candles)
+    let candles_per_day = if prices.len() > 1440 {
+        // Likely 5-minute candles (288 per day)
+        288
+    } else if prices.len() > 120 {
+        // Likely hourly candles (24 per day)
+        24
+    } else {
+        // Daily candles or less data
+        1
+    };
+
+    let lookback_5d = (5 * candles_per_day).min(prices.len() - 1);
+    let price_extended = if lookback_5d > 0 && prices.len() > lookback_5d {
+        let price_5d_ago = prices[prices.len() - lookback_5d - 1];
+        let price_change_5d = (*current_price - price_5d_ago) / price_5d_ago;
+        price_change_5d > 0.15 // More than 15% up in 5 days
+    } else {
+        false
+    };
+
+    if price_extended {
+        tracing::debug!(
+            "🚫 Price extension filter: Price up >15% in last {} candles, waiting for pullback",
+            lookback_5d
+        );
+    }
+
+    // ==================== RSI ACCELERATION CHECK ====================
+    // Only enter if RSI is RISING (momentum building, not fading)
+    let momentum_increasing = if prices.len() > config.rsi_period + 1 {
+        let rsi_previous = calculate_rsi(&prices[..prices.len()-1], config.rsi_period)
+            .unwrap_or(rsi);
+        rsi > rsi_previous
+    } else {
+        true // Default to true if insufficient data
+    };
+
+    if !momentum_increasing {
+        tracing::debug!("🚫 RSI acceleration filter: RSI falling (momentum fading)");
+    }
+
     // Check buy conditions
-    let rsi_condition = rsi < config.rsi_oversold + 10.0;
+    // FIXED: Changed from "RSI < threshold" to "RSI crosses ABOVE threshold"
+    // This waits for momentum to shift back up instead of catching falling knife
+    let rsi_condition = if let Some(prev) = prev_rsi {
+        prev < config.rsi_oversold && rsi >= config.rsi_oversold
+    } else {
+        // Fallback if no previous RSI: just check if RSI is near threshold
+        rsi >= config.rsi_oversold && rsi < config.rsi_oversold + 5.0
+    };
     let ma_crossover = short_ma > long_ma;
     let price_above_ma = *current_price > short_ma;
 
-    // Without volume data, require all 3 other conditions (more conservative)
-    // With volume data, require 3 out of 4 conditions (allows flexibility)
+    // FIXED: Require ALL 4 signals (not 3/4) + pass both filters
+    // This tightens entry to avoid buying at exhaustion
     let (buy_signal, buy_reason) = if has_volume_data {
-        let buy_conditions = [rsi_condition, ma_crossover, price_above_ma, volume_spike];
-        let buy_count = buy_conditions.iter().filter(|&&x| x).count();
+        let all_signals_met = rsi_condition && ma_crossover && price_above_ma && volume_spike;
+        let filters_passed = !price_extended && momentum_increasing;
+
         (
-            buy_count >= 3,
+            all_signals_met && filters_passed,
             format!(
-                "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} ({}/4 met)",
-                rsi_condition, ma_crossover, price_above_ma, volume_spike, buy_count
+                "BUY conditions: RSI<40={}, MA↑={}, Price>MA={}, Vol↑={} (ALL 4 required) | Filters: !Extended={}, RSI↑={}",
+                rsi_condition, ma_crossover, price_above_ma, volume_spike, !price_extended, momentum_increasing
             ),
         )
     } else {
-        // No volume data: require all 3 conditions (conservative mode)
-        let buy_conditions = [rsi_condition, ma_crossover, price_above_ma];
-        let buy_count = buy_conditions.iter().filter(|&&x| x).count();
-        let all_met = buy_count == 3;
+        // No volume data: require all 3 conditions + filters
+        let all_signals_met = rsi_condition && ma_crossover && price_above_ma;
+        let filters_passed = !price_extended && momentum_increasing;
+
         (
-            all_met,
+            all_signals_met && filters_passed,
             format!(
-                "BUY conditions (NO VOLUME): RSI<40={}, MA↑={}, Price>MA={} ({}/3 met, all required)",
-                rsi_condition, ma_crossover, price_above_ma, buy_count
+                "BUY conditions (NO VOLUME): RSI<40={}, MA↑={}, Price>MA={} (ALL 3 required) | Filters: !Extended={}, RSI↑={}",
+                rsi_condition, ma_crossover, price_above_ma, !price_extended, momentum_increasing
             ),
         )
     };

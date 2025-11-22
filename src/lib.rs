@@ -9,6 +9,7 @@ pub mod indicators;
 pub mod llm;
 pub mod models;
 pub mod persistence;
+pub mod regime;
 pub mod risk;
 pub mod strategy;
 

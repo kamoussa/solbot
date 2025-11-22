@@ -50,7 +50,7 @@ fn main() -> Result<()> {
         let candles = generator.generate(scenario, 500, 5);
 
         // Run backtest
-        match runner.run_and_report(&strategy, candles, "SYNTH", name) {
+        match runner.run_and_report(&strategy, candles, "SYNTH", 5, 0.0, name) {
             Ok(metrics) => {
                 all_metrics.push((name.to_string(), metrics));
             }

@@ -23,17 +23,19 @@ pub enum ExitReason {
 pub struct Position {
     pub id: Uuid,
     pub token: String,
-    pub entry_price: f64,
+    pub entry_price: f64,          // Average entry price for accumulated positions
     pub quantity: f64,
-    pub entry_time: DateTime<Utc>,
-    pub stop_loss: f64,           // -8% from entry
-    pub take_profit: Option<f64>, // Trailing stop
-    pub trailing_high: f64,       // Track highest price for trailing stop
+    pub entry_time: DateTime<Utc>, // First entry time
+    pub stop_loss: f64,            // -8% from (average) entry
+    pub take_profit: Option<f64>,  // Trailing stop
+    pub trailing_high: f64,        // Track highest price for trailing stop
     pub status: PositionStatus,
     pub realized_pnl: Option<f64>,
     pub exit_price: Option<f64>,
     pub exit_time: Option<DateTime<Utc>>,
     pub exit_reason: Option<ExitReason>,
+    pub allow_accumulation: bool, // If true, can add to this position (for DCA)
+    pub total_cost_basis: f64,    // Total $ invested (for tracking average price)
 }
 
 pub struct PositionManager {
@@ -96,26 +98,71 @@ impl PositionManager {
     }
 
     /// Create new position
+    ///
+    /// # Arguments
+    /// * `timestamp` - Optional timestamp for backtesting. If None, uses Utc::now() for live trading
     pub fn open_position(
         &mut self,
         token: String,
         entry_price: f64,
         quantity: f64,
     ) -> anyhow::Result<Uuid> {
-        // Check if we already have an open position for this token
-        if self.has_open_position(&token) {
-            anyhow::bail!("Already have open position for {}", token);
+        self.open_position_at(token, entry_price, quantity, None, false)
+    }
+
+    /// Create new position with explicit timestamp (for backtesting)
+    ///
+    /// If `allow_accumulation` is true on an existing position, this will add to that position
+    /// instead of creating a new one (for DCA strategies).
+    ///
+    /// # Arguments
+    /// * `allow_accumulation` - If true, allows adding to this position later (for DCA)
+    pub fn open_position_at(
+        &mut self,
+        token: String,
+        entry_price: f64,
+        quantity: f64,
+        timestamp: Option<DateTime<Utc>>,
+        allow_accumulation: bool,
+    ) -> anyhow::Result<Uuid> {
+        // Check if we have an open position that allows accumulation
+        if let Some(existing_pos) = self.get_open_position(&token) {
+            if existing_pos.allow_accumulation {
+                // Add to existing position (DCA accumulation)
+                let position_id = existing_pos.id;
+                let position = self.get_position_mut(position_id)?;
+
+                // Update accumulated values
+                position.total_cost_basis += entry_price * quantity;
+                position.quantity += quantity;
+                position.entry_price = position.total_cost_basis / position.quantity; // Average price
+
+                // Update stop loss and trailing high based on new average entry
+                position.stop_loss = position.entry_price * 0.92;
+                position.trailing_high = position.trailing_high.max(entry_price);
+
+                tracing::info!(
+                    "Accumulated {} @ ${:.2} (avg: ${:.2}, total qty: {:.4})",
+                    token, entry_price, position.entry_price, position.quantity
+                );
+
+                return Ok(position_id);
+            } else {
+                anyhow::bail!("Already have open position for {}", token);
+            }
         }
 
         let id = Uuid::new_v4();
         let stop_loss = entry_price * 0.92; // -8% from entry
+        let entry_time = timestamp.unwrap_or_else(Utc::now);
+        let total_cost_basis = entry_price * quantity;
 
         let position = Position {
             id,
             token,
             entry_price,
             quantity,
-            entry_time: Utc::now(),
+            entry_time,
             stop_loss,
             take_profit: None,
             trailing_high: entry_price,
@@ -124,6 +171,8 @@ impl PositionManager {
             exit_price: None,
             exit_time: None,
             exit_reason: None,
+            allow_accumulation, // Use the parameter
+            total_cost_basis,
         };
 
         self.positions.push(position);
@@ -192,10 +241,21 @@ impl PositionManager {
     }
 
     /// Check if position should exit (returns exit reason if yes)
+    /// Check if position should exit (for live trading - uses current time)
     pub fn should_exit(
         &mut self,
         position_id: Uuid,
         current_price: f64,
+    ) -> anyhow::Result<Option<ExitReason>> {
+        self.should_exit_at(position_id, current_price, None)
+    }
+
+    /// Check if position should exit with explicit timestamp (for backtesting)
+    pub fn should_exit_at(
+        &mut self,
+        position_id: Uuid,
+        current_price: f64,
+        current_time: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Option<ExitReason>> {
         // Update trailing stop first
         self.update_trailing_stop(position_id, current_price)?;
@@ -215,7 +275,8 @@ impl PositionManager {
         }
 
         // Check time stop (14 days)
-        let days_open = (Utc::now() - position.entry_time).num_days();
+        let now = current_time.unwrap_or_else(Utc::now);
+        let days_open = (now - position.entry_time).num_days();
         if days_open >= 14 {
             return Ok(Some(ExitReason::TimeStop));
         }
@@ -224,11 +285,25 @@ impl PositionManager {
     }
 
     /// Close position
+    ///
+    /// # Arguments
+    /// * `timestamp` - Optional timestamp for backtesting. If None, uses Utc::now() for live trading
     pub fn close_position(
         &mut self,
         position_id: Uuid,
         exit_price: f64,
         reason: ExitReason,
+    ) -> anyhow::Result<()> {
+        self.close_position_at(position_id, exit_price, reason, None)
+    }
+
+    /// Close position with explicit timestamp (for backtesting)
+    pub fn close_position_at(
+        &mut self,
+        position_id: Uuid,
+        exit_price: f64,
+        reason: ExitReason,
+        timestamp: Option<DateTime<Utc>>,
     ) -> anyhow::Result<()> {
         let position = self.get_position_mut(position_id)?;
 
@@ -237,11 +312,12 @@ impl PositionManager {
         }
 
         let pnl = (exit_price - position.entry_price) * position.quantity;
+        let exit_time = timestamp.unwrap_or_else(Utc::now);
 
         position.status = PositionStatus::Closed;
         position.realized_pnl = Some(pnl);
         position.exit_price = Some(exit_price);
-        position.exit_time = Some(Utc::now());
+        position.exit_time = Some(exit_time);
         position.exit_reason = Some(reason);
 
         // Update trading state
@@ -258,8 +334,17 @@ impl PositionManager {
         Ok(())
     }
 
-    /// Check all open positions for exits
+    /// Check all open positions for exits (live trading)
     pub fn check_exits(&mut self, prices: &HashMap<String, f64>) -> anyhow::Result<Vec<Uuid>> {
+        self.check_exits_at(prices, None)
+    }
+
+    /// Check all open positions for exits with explicit timestamp (backtesting)
+    pub fn check_exits_at(
+        &mut self,
+        prices: &HashMap<String, f64>,
+        current_time: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<Vec<Uuid>> {
         // First, collect position IDs and prices to check
         let positions_to_check: Vec<(Uuid, String, f64)> = self
             .positions
@@ -275,7 +360,7 @@ impl PositionManager {
         // Now check each position for exits
         let mut to_close = Vec::new();
         for (position_id, _token, current_price) in positions_to_check {
-            if let Some(reason) = self.should_exit(position_id, current_price)? {
+            if let Some(reason) = self.should_exit_at(position_id, current_price, current_time)? {
                 to_close.push((position_id, current_price, reason));
             }
         }
@@ -283,7 +368,7 @@ impl PositionManager {
         // Close positions
         let mut closed_ids = Vec::new();
         for (position_id, exit_price, reason) in to_close {
-            self.close_position(position_id, exit_price, reason)?;
+            self.close_position_at(position_id, exit_price, reason, current_time)?;
             closed_ids.push(position_id);
         }
 

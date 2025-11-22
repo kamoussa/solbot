@@ -22,10 +22,16 @@ docker-compose up -d postgres redis
 # Run bot
 cargo run
 
-# Backfill historical data for a token (optional)
+# Backfill historical data (optional)
+# Single token:
 cargo run backfill SOL So11111111111111111111111111111111111111112 --days 7
+# All tokens:
+COINGECKO_API_KEY=your_key ./scripts/backfill_all_tokens.sh 90
 
-# Run synthetic backtests
+# Tune RSI thresholds for all tokens
+cargo run --bin tune_rsi
+
+# Run backtests on real data
 cargo run --bin backtest_real
 
 # Stop services
